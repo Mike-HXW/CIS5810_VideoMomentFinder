@@ -1,0 +1,20 @@
+# Input media and generated results
+/input/*
+!/input/.gitkeep
+
+/output/*
+!/output/.gitkeep
+
+# Python and tool caches
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.ruff_cache/
+
+# Downloaded YOLO weights
+*.pt
+
+# Local virtual environments
+.venv/
+venv/
