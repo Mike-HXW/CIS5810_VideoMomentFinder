@@ -36,6 +36,27 @@ def save_csv(path, rows, fields):
         writer.writerows(rows)
 
 
+def draw_target(frame, target):
+    """Annotate a copy; never modify the original frame used for scoring."""
+    annotated = frame.copy()
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = (int(target[k]) for k in ('x1', 'y1', 'x2', 'y2'))
+    x1, x2 = max(0, min(width - 1, x1)), max(0, min(width - 1, x2))
+    y1, y2 = max(0, min(height - 1, y1)), max(0, min(height - 1, y2))
+    thickness = max(2, round(min(width, height) / 300))
+    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), thickness)
+    label = f'Target ID {target["track_id"]}'
+    scale = max(0.5, min(width, height) / 1100)
+    (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    tx = max(0, min(x1, width - tw - 8))
+    ty = min(height - baseline - 4, max(th + 4, y1 - 8))
+    cv2.rectangle(annotated, (tx, ty - th - 4),
+                  (min(width - 1, tx + tw + 8), ty + baseline + 4), (0, 0, 0), -1)
+    cv2.putText(annotated, label, (tx + 4, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 255, 0), thickness, cv2.LINE_AA)
+    return annotated
+
+
 class AestheticScorer:
     def __init__(self, device):
         from aesthetic_predictor_v2_5 import convert_v2_5_from_siglip
@@ -76,6 +97,8 @@ def run(args):
         output.mkdir(parents=True, exist_ok=False)
         (output / 'candidates').mkdir()
         (output / 'best').mkdir()
+        (output / 'candidates_target').mkdir()
+        (output / 'best_target').mkdir()
         print(f'Results folder: {output.resolve()}', flush=True)
         model_path = Path(args.model)
         if not model_path.is_absolute() and (PROJECT_DIR / model_path).is_file():
@@ -127,7 +150,10 @@ def run(args):
                         filename = f'candidates/frame_{frame_index:07d}.png'
                         if not cv2.imwrite(str(output / filename), frame):
                             raise OSError(f'Cannot save {filename}')
-                        candidates.append({**target, 'image': filename})
+                        target_filename = f'candidates_target/frame_{frame_index:07d}.png'
+                        if not cv2.imwrite(str(output / target_filename), draw_target(frame, target)):
+                            raise OSError(f'Cannot save {target_filename}')
+                        candidates.append({**target, 'image': filename, 'target_image': target_filename})
                         next_sample_time = timestamp + args.sample_seconds
                 frame_index += 1
                 if frame_index % max(1, round(fps * 2)) == 0:
@@ -152,19 +178,24 @@ def run(args):
         candidate['score'] = scorer.score(output / candidate['image'])
         print(f'Scored {index}/{len(candidates)}: frame {candidate["frame_index"]}, '
               f'{candidate["timestamp_seconds"]:.2f}s, score {candidate["score"]:.3f}', flush=True)
-    fields = ['frame_index', 'timestamp_seconds', 'track_id', 'x1', 'y1', 'x2', 'y2', 'confidence', 'image', 'score']
+    fields = ['frame_index', 'timestamp_seconds', 'track_id', 'x1', 'y1', 'x2', 'y2', 'confidence', 'image', 'target_image', 'score']
     save_csv(output / 'scores.csv', sorted(candidates, key=lambda c: -c['score']), fields)
     best = select_best(candidates, args.top_k, args.min_gap)
     cards = []
     for rank, candidate in enumerate(best, 1):
         filename = f'best/{rank:02d}_frame_{candidate["frame_index"]:07d}.png'
         shutil.copy2(output / candidate['image'], output / filename)
-        candidate = {**candidate, 'rank': rank, 'image': filename}
+        target_filename = f'best_target/{rank:02d}_frame_{candidate["frame_index"]:07d}.png'
+        shutil.copy2(output / candidate['target_image'], output / target_filename)
+        candidate = {**candidate, 'rank': rank, 'image': filename, 'target_image': target_filename}
         best[rank - 1] = candidate
         cards.append(f'<figure><a href="{filename}"><img src="{filename}" alt="Rank {rank}"></a>'
                      f'<figcaption>#{rank} · Score {candidate["score"]:.3f} · '
                      f'{candidate["timestamp_seconds"]:.2f}s · Frame {candidate["frame_index"]}'
-                     f' · Person ID {target_id}</figcaption></figure>')
+                     f' · Person ID {target_id}</figcaption>'
+                     f'<details><summary>Show target box</summary>'
+                     f'<a href="{target_filename}"><img src="{target_filename}" alt="Target ID {target_id}"></a>'
+                     f'</details></figure>')
     save_csv(output / 'best_frames.csv', best, ['rank'] + fields)
     (output / 'index.html').write_text(
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>Video Moment Finder</title>'
@@ -181,7 +212,7 @@ def run(args):
     print(f'Done. Selected {len(best)} of {len(candidates)} candidates.', flush=True)
     print(f'Open gallery: {output.resolve() / "index.html"}', flush=True)
     if len(best) < args.top_k:
-        print('Fewer frames selected because of the time-gap constraint.', flush=True)
+        print('Fewer frames selected: limited target candidates and/or minimum time gap.', flush=True)
     return output
 
 

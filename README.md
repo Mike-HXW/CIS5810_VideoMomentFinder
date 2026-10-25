@@ -102,3 +102,11 @@ on the first run and cached. Default inference uses CPU; separate options
 
 References: [Ultralytics tracking](https://docs.ultralytics.com/modes/track/)
 and [Aesthetic Predictor V2.5](https://github.com/discus0434/aesthetic-predictor-v2-5).
+
+### Target-box copies
+
+Each run also saves `candidates_target/` and `best_target/`, matching the
+original candidate and selected PNGs but with only the target person boxed
+and labeled with its tracking ID. CSV files include `target_image` paths.
+In `index.html`, expand **Show target box** under a selected photo to inspect
+its target. Aesthetic scoring continues to use only unannotated originals.
