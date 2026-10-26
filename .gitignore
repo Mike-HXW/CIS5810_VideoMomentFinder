@@ -18,3 +18,7 @@ __pycache__/
 # Local virtual environments
 .venv/
 venv/
+/external/aesthetic-predictor-v2-5/
+
+/weights/
+/runs/
