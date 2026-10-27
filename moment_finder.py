@@ -1,4 +1,4 @@
-"""Track one person and rank unannotated video frames by aesthetic score."""
+"""Track one person and rank video frames with target-aware quality metrics."""
 from __future__ import annotations
 
 import argparse
@@ -15,10 +15,11 @@ import torch
 from PIL import Image
 
 from human_detector import HumanDetector, INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
+from target_metrics import PRESET_WEIGHTS, score_candidates
 
 
 def select_best(candidates, top_k, min_gap):
-    """Greedy aesthetic ranking with minimum temporal separation."""
+    """Greedy final-score ranking with minimum temporal separation."""
     selected = []
     for candidate in sorted(candidates, key=lambda c: (-c['score'], c['frame_index'])):
         if all(abs(candidate['timestamp_seconds'] - c['timestamp_seconds']) >= min_gap
@@ -91,6 +92,11 @@ def run(args):
     if not math.isfinite(fps) or fps <= 0:
         capture.release()
         raise ValueError('Video has no valid FPS; timestamps cannot be calculated.')
+    frame_width = round(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if frame_width <= 0 or frame_height <= 0:
+        capture.release()
+        raise ValueError('Video has no valid frame dimensions.')
     output = Path(args.output) if args.output else OUTPUT_DIR / (
         f'{source.stem}_moments_' + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     try:
@@ -106,6 +112,7 @@ def run(args):
         detector = HumanDetector(model=str(model_path), confidence=args.confidence, device=args.device)
         target_id = args.target_id
         candidates = []
+        target_presence = []
         frame_index = 0
         target_frames = 0
         next_sample_time = 0.0
@@ -144,6 +151,7 @@ def run(args):
                     writer.writerow({**person, 'is_target': person['track_id'] == target_id})
                     if person['track_id'] == target_id:
                         target = person
+                target_presence.append(target is not None)
                 if target is not None:
                     target_frames += 1
                     if timestamp + 1e-9 >= next_sample_time:
@@ -161,12 +169,15 @@ def run(args):
     finally:
         capture.release()
 
-    summary = dict(source=str(source), fps=fps, frame_index_base=0,
+    ranking_preset = getattr(args, 'ranking_preset', 'balanced')
+    summary = dict(source=str(source), fps=fps, frame_width=frame_width,
+                   frame_height=frame_height, frame_index_base=0,
                    timestamp_method='frame_index / fps (constant-frame-rate assumption)',
                    processed_frames=frame_index, target_id=target_id, target_visible_frames=target_frames,
                    sample_seconds=args.sample_seconds, min_gap_seconds=args.min_gap,
                    requested_top_k=args.top_k, candidate_count=len(candidates),
-                   selection='Aesthetic score of the entire original frame; no bounding boxes',
+                   ranking_preset=ranking_preset,
+                   selection='Target-aware weighted score with temporal separation',
                    status='tracking_complete')
     summary_path = output / 'summary.json'
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
@@ -175,10 +186,35 @@ def run(args):
 
     scorer = AestheticScorer(args.aesthetic_device)
     for index, candidate in enumerate(candidates, 1):
-        candidate['score'] = scorer.score(output / candidate['image'])
-        print(f'Scored {index}/{len(candidates)}: frame {candidate["frame_index"]}, '
-              f'{candidate["timestamp_seconds"]:.2f}s, score {candidate["score"]:.3f}', flush=True)
-    fields = ['frame_index', 'timestamp_seconds', 'track_id', 'x1', 'y1', 'x2', 'y2', 'confidence', 'image', 'target_image', 'score']
+        candidate['aesthetic_score'] = scorer.score(output / candidate['image'])
+        print(f'Aesthetic {index}/{len(candidates)}: frame {candidate["frame_index"]}, '
+              f'{candidate["timestamp_seconds"]:.2f}s, '
+              f'raw {candidate["aesthetic_score"]:.3f}', flush=True)
+    weights = score_candidates(
+        candidates=candidates,
+        output_dir=output,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        target_presence=target_presence,
+        fps=fps,
+        preset=ranking_preset,
+    )
+    for index, candidate in enumerate(candidates, 1):
+        print(
+            f'Target metrics {index}/{len(candidates)}: frame {candidate["frame_index"]}, '
+            f'final {candidate["score"]:.3f}, sharp {candidate["sharpness_score"]:.3f}, '
+            f'visible {candidate["visibility_score"]:.3f}, '
+            f'composition {candidate["composition_score"]:.3f}',
+            flush=True,
+        )
+    fields = [
+        'frame_index', 'timestamp_seconds', 'track_id',
+        'x1', 'y1', 'x2', 'y2', 'confidence', 'image', 'target_image',
+        'aesthetic_score', 'aesthetic_normalized',
+        'sharpness_raw', 'sharpness_score',
+        'area_ratio', 'size_score', 'edge_clearance_score',
+        'track_stability_score', 'visibility_score', 'composition_score', 'score',
+    ]
     save_csv(output / 'scores.csv', sorted(candidates, key=lambda c: -c['score']), fields)
     best = select_best(candidates, args.top_k, args.min_gap)
     cards = []
@@ -190,7 +226,11 @@ def run(args):
         candidate = {**candidate, 'rank': rank, 'image': filename, 'target_image': target_filename}
         best[rank - 1] = candidate
         cards.append(f'<figure><a href="{filename}"><img src="{filename}" alt="Rank {rank}"></a>'
-                     f'<figcaption>#{rank} · Score {candidate["score"]:.3f} · '
+                     f'<figcaption>#{rank} · Final {candidate["score"]:.3f} · '
+                     f'Aesthetic {candidate["aesthetic_normalized"]:.3f} · '
+                     f'Sharpness {candidate["sharpness_score"]:.3f} · '
+                     f'Visibility {candidate["visibility_score"]:.3f} · '
+                     f'Composition {candidate["composition_score"]:.3f} · '
                      f'{candidate["timestamp_seconds"]:.2f}s · Frame {candidate["frame_index"]}'
                      f' · Person ID {target_id}</figcaption>'
                      f'<details><summary>Show target box</summary>'
@@ -203,11 +243,13 @@ def run(args):
         'main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}'
         'figure{margin:0;background:white;padding:12px}img{width:100%}figcaption{padding:12px 0}</style>'
         f'<h1>Best Video Moments</h1><p>{html.escape(source.name)} · Target ID {target_id}</p>'
-        '<p>Ranked by whole-frame aesthetics. Frame numbers start at 0. '
+        f'<p>Ranking preset: {html.escape(ranking_preset)}. '
+        'Final score combines whole-frame aesthetics, subject sharpness, '
+        'subject visibility, and low-weight composition. Frame numbers start at 0. '
         'Time separation reduces adjacent picks; it does not guarantee visual diversity.</p><main>'
         + ''.join(cards) + '</main></html>', encoding='utf-8',
     )
-    summary.update(status='complete', selected_count=len(best))
+    summary.update(status='complete', selected_count=len(best), metric_weights=weights)
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(f'Done. Selected {len(best)} of {len(candidates)} candidates.', flush=True)
     print(f'Open gallery: {output.resolve() / "index.html"}', flush=True)
@@ -229,6 +271,10 @@ def build_parser():
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--min-gap', type=float, default=1.0, help='Seconds between selected frames')
     parser.add_argument('--max-seconds', type=float, help='Process only the beginning of the video')
+    parser.add_argument(
+        '--ranking-preset', default='balanced', choices=sorted(PRESET_WEIGHTS),
+        help='Fixed target-aware metric weights; aesthetic-only is a diagnostic baseline',
+    )
     return parser
 
 
