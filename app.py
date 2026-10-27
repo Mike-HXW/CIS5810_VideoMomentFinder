@@ -17,6 +17,17 @@ from moment_finder import run
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
+PRESET_CHOICES = [
+    ("Balanced", "balanced"),
+    ("Clear subject", "clear-subject"),
+    ("Subject fully shown", "subject-fully-shown"),
+    ("Best-looking scene", "best-looking-scene"),
+]
+PRESET_LABELS = {value: label for label, value in PRESET_CHOICES}
+SCORE_HEADERS = [
+    "Rank", "Timestamp", "Frame", "Final", "Aesthetic",
+    "Sharpness", "Visibility", "Composition",
+]
 
 
 APP_CSS = """
@@ -52,6 +63,31 @@ APP_CSS = """
 }
 #control-panel { align-self: flex-start; }
 #control-panel .tabs { background: transparent; }
+#ranking-preset { margin: 14px 0 4px; }
+#ranking-preset label { color: #000000 !important; }
+[role="listbox"] {
+  background: #ffffff !important;
+  border: 1px solid #cbd8e8 !important;
+  color: var(--vmf-ink) !important;
+}
+[data-testid="dropdown-option"] {
+  background: #ffffff !important;
+  color: var(--vmf-ink) !important;
+}
+[data-testid="dropdown-option"].selected,
+[data-testid="dropdown-option"]:hover {
+  background: #eaf2ff !important;
+  color: var(--vmf-ink) !important;
+}
+/* Gradio adds Tailwind's dark:bg-gray-600 to selected dropdown rows. */
+html body .gradio-container ul.option-list li[data-testid="dropdown-option"].item.selected.active.bg-gray-100.dark\\:bg-gray-600,
+html body .gradio-container ul.option-list li[data-testid="dropdown-option"].item {
+  background: #eaf2ff !important;
+  color: var(--vmf-ink) !important;
+}
+html body .gradio-container ul.option-list li[data-testid="dropdown-option"]:not(.selected) {
+  background: #ffffff !important;
+}
 #control-panel label,
 #control-panel label span,
 #control-panel [data-testid="block-label"],
@@ -103,6 +139,7 @@ APP_CSS = """
   border-spacing: 0;
   overflow: hidden;
   width: 100%;
+  font-size: 0.88rem;
 }
 .vmf-score-table th, .vmf-score-table td {
   border-bottom: 1px solid var(--vmf-line);
@@ -113,6 +150,9 @@ APP_CSS = """
 .vmf-score-table th { background: #eef4fb; font-size: 0.82rem; }
 .vmf-score-table td { background: #ffffff; }
 .vmf-score-table tr:last-child td { border-bottom: 0; }
+@media (max-width: 900px) {
+  .vmf-score-table { display: block; overflow-x: auto; white-space: nowrap; }
+}
 @media (max-width: 900px) {
   .gradio-container { padding: 18px 12px 28px !important; }
   #control-panel, #results-panel { padding: 12px; }
@@ -185,11 +225,22 @@ def _load_results(output: Path):
         rank = int(row["rank"])
         timestamp = float(row["timestamp_seconds"])
         frame_index = int(row["frame_index"])
-        score = float(row["score"])
+        final_score = float(row["score"])
         image_path = output / row["image"]
-        caption = f"#{rank}  ·  {timestamp:.2f}s  ·  Frame {frame_index}  ·  Score {score:.3f}"
+        caption = (
+            f"#{rank}  ·  {timestamp:.2f}s  ·  Frame {frame_index}  ·  "
+            f"Final {final_score:.3f}"
+        )
         gallery.append((str(image_path), caption))
-        table.append([rank, f"{timestamp:.2f}s", frame_index, f"{score:.3f}"])
+        def metric(name: str) -> str:
+            value = row.get(name)
+            return f"{float(value):.3f}" if value not in (None, "") else "—"
+
+        table.append([
+            rank, f"{timestamp:.2f}s", frame_index, f"{final_score:.3f}",
+            metric("aesthetic_normalized"), metric("sharpness_score"),
+            metric("visibility_score"), metric("composition_score"),
+        ])
     return gallery, table
 
 
@@ -199,12 +250,12 @@ def _score_table_html(rows: list[list[object]]) -> str:
         for row in rows
     )
     if not body:
-        body = '<tr><td colspan="4">Scores will appear after analysis.</td></tr>'
+        body = f'<tr><td colspan="{len(SCORE_HEADERS)}">Scores will appear after analysis.</td></tr>'
+    headers = "".join(f"<th>{html.escape(header)}</th>" for header in SCORE_HEADERS)
     return (
         '<p class="vmf-score-title">Scores</p>'
         '<table class="vmf-score-table"><thead><tr>'
-        '<th>Rank</th><th>Timestamp</th><th>Frame</th><th>Aesthetic score</th>'
-        f'</tr></thead><tbody>{body}</tbody></table>'
+        f'{headers}</tr></thead><tbody>{body}</tbody></table>'
     )
 
 
@@ -219,6 +270,7 @@ def analyze_video(
     top_k,
     min_gap,
     max_seconds,
+    ranking_preset,
     progress=gr.Progress(),
 ):
     """Run the existing pipeline and format its outputs for Gradio."""
@@ -238,6 +290,8 @@ def analyze_video(
             raise ValueError("Minimum gap must be nonnegative.")
         if top_k < 1:
             raise ValueError("Top K must be at least 1.")
+        if ranking_preset not in PRESET_LABELS:
+            raise ValueError("Choose a valid ranking preference.")
 
         progress(0.04, desc="Preparing video")
         source = _resolve_source(source_mode, uploaded_video, input_video)
@@ -253,6 +307,7 @@ def analyze_video(
             top_k=top_k,
             min_gap=min_gap,
             max_seconds=max_seconds,
+            ranking_preset=ranking_preset,
         )
         progress(0.12, desc="Tracking person and scoring candidate frames")
         output = Path(run(args)).resolve()
@@ -260,7 +315,8 @@ def analyze_video(
         gallery, table = _load_results(output)
         status = (
             '<div class="vmf-success"><strong>Analysis complete.</strong> '
-            f'Selected {len(gallery)} moment(s) from <code>{html.escape(source.name)}</code>.</div>'
+            f'Selected {len(gallery)} moment(s) from <code>{html.escape(source.name)}</code> '
+            f'using <strong>{html.escape(PRESET_LABELS[ranking_preset])}</strong>.</div>'
         )
         progress(1.0, desc="Complete")
         return status, gallery, _score_table_html(table), str(output)
@@ -321,6 +377,14 @@ def build_app() -> gr.Blocks:
                             info="Choose an existing video from the project's input folder.",
                         )
                         refresh_button = gr.Button("Refresh input folder", variant="secondary")
+
+                ranking_preset = gr.Radio(
+                    choices=PRESET_CHOICES,
+                    value="balanced",
+                    label="Ranking preference",
+                    info="Choose what the ranking should prioritize; no numeric tuning required.",
+                    elem_id="ranking-preset",
+                )
 
                 gr.Markdown("### Analysis settings")
                 with gr.Row():
@@ -385,6 +449,7 @@ def build_app() -> gr.Blocks:
                 top_k,
                 min_gap,
                 max_seconds,
+                ranking_preset,
             ],
             outputs=[status, gallery, scores, output_folder],
         )

@@ -5,9 +5,16 @@ The local Gradio app supports two video sources:
 - Upload a video. The app copies it into `input/` before analysis.
 - Select an existing video from `input/` and refresh the list without restarting.
 
-The app calls the same tracking and aesthetic-scoring pipeline as
-`moment_finder.py`. Selected frames, timestamps, frame numbers, aesthetic
-scores, and the output directory are shown after each run.
+The app calls the same target-aware ranking pipeline as `moment_finder.py`.
+Choose one fixed ranking preference instead of tuning numeric weights:
+
+- **Balanced**: a mix of whole-frame aesthetics, subject sharpness, and visibility.
+- **Clear subject**: gives subject sharpness more influence.
+- **Subject fully shown**: gives target size, edge clearance, and tracking stability more influence.
+- **Best-looking scene**: gives whole-frame aesthetic quality more influence.
+
+Selected frames, timestamps, component scores, and the output directory are
+shown after each run.
 
 ## Start
 
