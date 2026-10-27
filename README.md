@@ -3,7 +3,7 @@
 This module detects people in an image or video and draws a green bounding box
 with a confidence score around each detection.
 
-## Setup
+## Setup (Windows)
 
 Clone this repository, create a project-local virtual environment, and install
 the Python dependencies:
@@ -40,6 +40,20 @@ running the editable-install command.
 Do not commit `external/`, `.venv/`, `weights/`, `runs/`, `input/`, or `output/`.
 They are machine-local dependencies, models, and generated data; the project's
 `.gitignore` excludes them.
+
+### Start the web app
+
+After completing setup, start the local Gradio interface with:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python app.py
+```
+
+Open the local URL printed in the terminal, normally
+`http://127.0.0.1:7860`. The page can upload a video or choose one from
+`input/`, select a fixed ranking preference, and display the selected frames
+with their target-aware score components.
 
 ## Command-line usage
 
