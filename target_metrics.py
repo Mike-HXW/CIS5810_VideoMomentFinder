@@ -96,12 +96,7 @@ def tenengrad_sharpness(frame: np.ndarray, bbox: Sequence[float]) -> float:
     return score if math.isfinite(score) else 0.0
 
 
-def visibility_components(
-    bbox: Sequence[float],
-    frame_width: int,
-    frame_height: int,
-    track_stability: float,
-) -> dict[str, float]:
+def visibility_components(bbox: Sequence[float], frame_width: int, frame_height: int, track_stability: float,) -> dict[str, float]:
     """Return interpretable framing proxies for target visibility.
 
     This intentionally does not claim to detect semantic occlusion. It scores
@@ -142,9 +137,7 @@ def visibility_components(
     }
 
 
-def composition_score(
-    bbox: Sequence[float], frame_width: int, frame_height: int,
-) -> float:
+def composition_score(bbox: Sequence[float], frame_width: int, frame_height: int,) -> float:
     """Return a low-stakes rule-of-thirds proximity score in [0, 1]."""
     box = _validated_box(bbox, frame_width, frame_height)
     if box is None:
@@ -175,9 +168,7 @@ def robust_normalize(values: Iterable[float]) -> list[float]:
     return [float(value) for value in normalized]
 
 
-def track_stability_for_frame(
-    target_presence: Sequence[bool], frame_index: int, window_frames: int,
-) -> float:
+def track_stability_for_frame(target_presence: Sequence[bool], frame_index: int, window_frames: int,) -> float:
     """Fraction of frames containing the target around a candidate frame."""
     if not target_presence:
         return 0.0
@@ -197,7 +188,11 @@ def score_candidates(
     fps: float,
     preset: str = "balanced",
 ) -> dict[str, float]:
-    """Populate target-aware metric fields and final ``score`` in place."""
+    """Score candidates in place and return the weights used for this preset.
+
+    Each candidate already has a whole-frame aesthetic score and a target box.
+    This function adds target metrics, normalized scores, and a final score.
+    """
     if preset not in PRESET_WEIGHTS:
         raise ValueError(f"Unknown ranking preset: {preset}")
     if frame_width <= 0 or frame_height <= 0:
@@ -206,24 +201,32 @@ def score_candidates(
         raise ValueError("FPS must be positive and finite.")
 
     output_dir = Path(output_dir)
+    # Inspect target presence within 0.5s
     stability_window_frames = max(1, round(fps * 0.5))
     for candidate in candidates:
+        # load the original frame + recover the tracked subject bounding box
         image_path = output_dir / candidate["image"]
         frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if frame is None:
             raise OSError(f"Cannot read candidate image for metrics: {image_path}")
         bbox = [candidate[key] for key in ("x1", "y1", "x2", "y2")]
+
+        # sobel gradient
         candidate["sharpness_raw"] = tenengrad_sharpness(frame, bbox)
         stability = track_stability_for_frame(
             target_presence, candidate["frame_index"], stability_window_frames,
         )
+        # visibility = target size + distance from frame edges + tracking continuity
         candidate.update(visibility_components(bbox, frame_width, frame_height, stability))
+        # composition proximity to rule-of-thirds points
         candidate["composition_score"] = composition_score(bbox, frame_width, frame_height)
 
+    # normalize aesthetics and sharpness
     aesthetic_values = [candidate["aesthetic_score"] for candidate in candidates]
     sharpness_values = [candidate["sharpness_raw"] for candidate in candidates]
     aesthetic_normalized = robust_normalize(aesthetic_values)
     sharpness_normalized = robust_normalize(sharpness_values)
+    # selected preset produce one final ranking score
     weights = PRESET_WEIGHTS[preset]
     for candidate, aesthetic_score, sharpness_score in zip(
         candidates, aesthetic_normalized, sharpness_normalized,
