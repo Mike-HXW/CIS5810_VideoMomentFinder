@@ -7,3 +7,4 @@ lap>=0.5.12
 aesthetic-predictor-v2-5==2024.12.18.1
 pillow>=7.1.2
 gradio>=5.0,<7
+imageio-ffmpeg

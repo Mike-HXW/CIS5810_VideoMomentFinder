@@ -14,6 +14,7 @@ import cv2
 import torch
 from PIL import Image
 
+from baseline_exports import save_baselines
 from human_detector import HumanDetector, INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
 from target_metrics import PRESET_WEIGHTS, score_candidates
 
@@ -89,6 +90,7 @@ def run(args):
     if not capture.isOpened():
         raise ValueError(f'Cannot open video: {source}')
     fps = capture.get(cv2.CAP_PROP_FPS)
+    source_frame_count = capture.get(cv2.CAP_PROP_FRAME_COUNT)
     if not math.isfinite(fps) or fps <= 0:
         capture.release()
         raise ValueError('Video has no valid FPS; timestamps cannot be calculated.')
@@ -249,7 +251,9 @@ def run(args):
         'Time separation reduces adjacent picks; it does not guarantee visual diversity.</p><main>'
         + ''.join(cards) + '</main></html>', encoding='utf-8',
     )
-    summary.update(status='complete', selected_count=len(best), metric_weights=weights)
+    baselines = save_baselines(source, output, candidates, source_frame_count)
+    summary.update(status='complete', selected_count=len(best), metric_weights=weights,
+                   baselines=baselines)
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(f'Done. Selected {len(best)} of {len(candidates)} candidates.', flush=True)
     print(f'Open gallery: {output.resolve() / "index.html"}', flush=True)

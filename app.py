@@ -400,7 +400,7 @@ def build_app() -> gr.Blocks:
                     )
                 confidence = gr.Slider(0.05, 1.0, value=0.25, step=0.05, label="Detection confidence")
                 with gr.Row():
-                    sample_seconds = gr.Number(value=0.5, minimum=0.05, label="Sample interval (seconds)")
+                    sample_seconds = gr.Number(value=0.333, minimum=0.05, label="Sample interval (seconds)")
                     top_k = gr.Number(value=5, minimum=1, precision=0, label="Top K")
                 with gr.Row():
                     min_gap = gr.Number(value=1.0, minimum=0, label="Minimum gap (seconds)")
