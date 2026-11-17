@@ -187,6 +187,7 @@ def score_candidates(
     target_presence: Sequence[bool],
     fps: float,
     preset: str = "balanced",
+    scene: bool = False,
 ) -> dict[str, float]:
     """Score candidates in place and return the weights used for this preset.
 
@@ -209,10 +210,12 @@ def score_candidates(
         frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if frame is None:
             raise OSError(f"Cannot read candidate image for metrics: {image_path}")
-        bbox = [candidate[key] for key in ("x1", "y1", "x2", "y2")]
+        bbox = [0, 0, frame_width, frame_height] if scene else [candidate[key] for key in ("x1", "y1", "x2", "y2")]
 
         # sobel gradient
         candidate["sharpness_raw"] = tenengrad_sharpness(frame, bbox)
+        if scene:
+            continue
         stability = track_stability_for_frame(
             target_presence, candidate["frame_index"], stability_window_frames,
         )
@@ -227,12 +230,15 @@ def score_candidates(
     aesthetic_normalized = robust_normalize(aesthetic_values)
     sharpness_normalized = robust_normalize(sharpness_values)
     # selected preset produce one final ranking score
-    weights = PRESET_WEIGHTS[preset]
+    weights = {"aesthetic": 0.7, "sharpness": 0.3} if scene else PRESET_WEIGHTS[preset]
     for candidate, aesthetic_score, sharpness_score in zip(
         candidates, aesthetic_normalized, sharpness_normalized,
     ):
         candidate["aesthetic_normalized"] = aesthetic_score
         candidate["sharpness_score"] = sharpness_score
+        if scene:
+            candidate["score"] = weights["aesthetic"] * aesthetic_score + weights["sharpness"] * sharpness_score
+            continue
         candidate["score"] = sum((
             weights["aesthetic"] * aesthetic_score,
             weights["sharpness"] * sharpness_score,

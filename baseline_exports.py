@@ -63,7 +63,7 @@ def save_baselines(source, output, candidates, frame_count):
     results = {'aesthetic_only': {
         'image': aesthetic_path, 'frame_index': top['frame_index'],
         'timestamp_seconds': top['timestamp_seconds'], 'aesthetic_score': top['aesthetic_score'],
-        'scope': 'tracked_candidates',
+        'scope': 'tracked_candidates' if top.get('track_id') is not None else 'scene_candidates',
     }}
 
     try:

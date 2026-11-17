@@ -14,6 +14,7 @@ import torch
 
 from human_detector import INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
 from moment_finder import run
+from subject_preview import scan_subjects
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -172,7 +173,7 @@ def list_input_videos() -> list[str]:
 
 def refresh_input_choices():
     choices = list_input_videos()
-    return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+    return gr.Dropdown(choices=choices, value=None)
 
 
 def _safe_uploaded_name(upload_path: Path) -> str:
@@ -259,6 +260,35 @@ def _score_table_html(rows: list[list[object]]) -> str:
     )
 
 
+def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, progress=gr.Progress()):
+    if (source_mode == 'upload' and not uploaded_video) or (source_mode == 'folder' and not input_video):
+        return None, None, [], [], 'Entire scene selected', gr.update(visible=False)
+    progress(0, desc='Finding people in the video')
+    source = _resolve_source(source_mode, uploaded_video, input_video)
+    scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26n.pt'), yolo_device, float(confidence))
+    recommended = [track for track in scan['tracks'] if track['recommended']][:5]
+    shown_ids = {track['id'] for track in recommended}
+    more = [track for track in scan['tracks'] if track['id'] not in shown_ids]
+    scan['recommended_ids'] = [track['id'] for track in recommended]
+    scan['more_ids'] = [track['id'] for track in more]
+    def gallery_items(tracks):
+        return [(track['preview'], f"Person {track['id']} · {track['seconds']:.1f}s") for track in tracks]
+    return scan, None, gallery_items(recommended), gallery_items(more), 'Entire scene selected', gr.update(visible=bool(more))
+
+
+def select_subject(scan, group, evt: gr.SelectData):
+    track_id = scan[group][evt.index]
+    return track_id, f'Person {track_id} selected'
+
+
+def select_recommended(scan, evt: gr.SelectData):
+    return select_subject(scan, 'recommended_ids', evt)
+
+
+def select_more(scan, evt: gr.SelectData):
+    return select_subject(scan, 'more_ids', evt)
+
+
 def analyze_video(
     source_mode,
     uploaded_video,
@@ -271,6 +301,8 @@ def analyze_video(
     min_gap,
     max_seconds,
     ranking_preset,
+    scan,
+    selected_subject,
     progress=gr.Progress(),
 ):
     """Run the existing pipeline and format its outputs for Gradio."""
@@ -294,7 +326,9 @@ def analyze_video(
             raise ValueError("Choose a valid ranking preference.")
 
         progress(0.04, desc="Preparing video")
-        source = _resolve_source(source_mode, uploaded_video, input_video)
+        if scan is None:
+            raise ValueError('Choose a video and wait for its subject preview.')
+        source = Path(scan['source'])
         args = argparse.Namespace(
             input=str(source),
             output=None,
@@ -302,21 +336,23 @@ def analyze_video(
             device=yolo_device,
             aesthetic_device=aesthetic_device,
             confidence=confidence,
-            target_id=None,
+            target_id=selected_subject,
+            scene=selected_subject is None,
+            scan=scan,
             sample_seconds=sample_seconds,
             top_k=top_k,
             min_gap=min_gap,
             max_seconds=max_seconds,
             ranking_preset=ranking_preset,
         )
-        progress(0.12, desc="Tracking person and scoring candidate frames")
+        progress(0.12, desc="Scoring candidate frames")
         output = Path(run(args)).resolve()
         progress(0.96, desc="Loading selected moments")
         gallery, table = _load_results(output)
         status = (
             '<div class="vmf-success"><strong>Analysis complete.</strong> '
             f'Selected {len(gallery)} moment(s) from <code>{html.escape(source.name)}</code> '
-            f'using <strong>{html.escape(PRESET_LABELS[ranking_preset])}</strong>.</div>'
+            f'using <strong>{html.escape("Entire scene" if selected_subject is None else PRESET_LABELS[ranking_preset])}</strong>.</div>'
         )
         progress(1.0, desc="Complete")
         return status, gallery, _score_table_html(table), str(output)
@@ -355,6 +391,8 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="Video Moment Finder", fill_width=True) as app:
         source_mode = gr.State("upload")
+        scan_state = gr.State(None)
+        selected_subject = gr.State(None)
         gr.Markdown(
             "# Video Moment Finder\nUpload or select a video, then find its best-looking moments.",
             elem_id="vmf-header",
@@ -372,17 +410,25 @@ def build_app() -> gr.Blocks:
                     with gr.Tab("Input folder") as folder_tab:
                         input_video = gr.Dropdown(
                             choices=input_choices,
-                            value=input_choices[0] if input_choices else None,
+                            value=None,
                             label="Video in input/",
                             info="Choose an existing video from the project's input folder.",
                         )
                         refresh_button = gr.Button("Refresh input folder", variant="secondary")
 
+                gr.Markdown('### Choose a subject')
+                gr.Markdown('Choose a person or analyze the entire scene.')
+                entire_scene = gr.Button('Entire scene', variant='secondary')
+                subject_label = gr.Markdown('Entire scene selected')
+                subjects = gr.Gallery(label='Recommended people', columns=5, height='auto', object_fit='contain', allow_preview=False)
+                with gr.Accordion('Show more', open=False, visible=False) as more_section:
+                    more_subjects = gr.Gallery(label='More people', columns=5, height='auto', object_fit='contain', allow_preview=False)
+
                 ranking_preset = gr.Radio(
                     choices=PRESET_CHOICES,
                     value="balanced",
                     label="Ranking preference",
-                    info="Choose what the ranking should prioritize; no numeric tuning required.",
+                    info="Applies when a person is selected. Entire scene uses aesthetics and whole-frame sharpness.",
                     elem_id="ranking-preset",
                 )
 
@@ -403,7 +449,7 @@ def build_app() -> gr.Blocks:
                     sample_seconds = gr.Number(value=0.333, minimum=0.05, label="Sample interval (seconds)")
                     top_k = gr.Number(value=5, minimum=1, precision=0, label="Top K")
                 with gr.Row():
-                    min_gap = gr.Number(value=1.0, minimum=0, label="Minimum gap (seconds)")
+                    min_gap = gr.Number(value=0.2, minimum=0, label="Minimum gap (seconds)")
                     max_seconds = gr.Textbox(
                         value="",
                         label="Max seconds (optional)",
@@ -436,6 +482,17 @@ def build_app() -> gr.Blocks:
         upload_tab.select(lambda: "upload", outputs=source_mode, queue=False)
         folder_tab.select(lambda: "folder", outputs=source_mode, queue=False)
         refresh_button.click(refresh_input_choices, outputs=input_video, queue=False)
+        preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section]
+        uploaded_video.change(lambda video, device, conf: preview_subjects('upload', video, None, device, conf),
+                              inputs=[uploaded_video, yolo_device, confidence], outputs=preview_outputs)
+        input_video.change(lambda video, device, conf: preview_subjects('folder', None, video, device, conf),
+                           inputs=[input_video, yolo_device, confidence], outputs=preview_outputs)
+        upload_tab.select(lambda video, device, conf: preview_subjects('upload', video, None, device, conf), inputs=[uploaded_video, yolo_device, confidence], outputs=preview_outputs)
+        folder_tab.select(lambda: (None, None, [], [], 'Entire scene selected', gr.update(visible=False), None),
+                          outputs=preview_outputs + [input_video], queue=False)
+        subjects.select(select_recommended, inputs=[scan_state], outputs=[selected_subject, subject_label])
+        more_subjects.select(select_more, inputs=[scan_state], outputs=[selected_subject, subject_label])
+        entire_scene.click(lambda: (None, 'Entire scene selected'), outputs=[selected_subject, subject_label], queue=False)
         analyze_button.click(
             analyze_video,
             inputs=[
@@ -450,6 +507,8 @@ def build_app() -> gr.Blocks:
                 min_gap,
                 max_seconds,
                 ranking_preset,
+                scan_state,
+                selected_subject,
             ],
             outputs=[status, gallery, scores, output_folder],
         )
