@@ -25,6 +25,7 @@ PRESET_CHOICES = [
     ("Best-looking scene", "best-looking-scene"),
 ]
 PRESET_LABELS = {value: label for label, value in PRESET_CHOICES}
+SCAN_CACHE_SIZE = 2  # Enough for one upload plus one input-folder video per session.
 SCORE_HEADERS = [
     "Rank", "Timestamp", "Frame", "Final", "Aesthetic",
     "Sharpness", "Visibility", "Composition",
@@ -260,12 +261,36 @@ def _score_table_html(rows: list[list[object]]) -> str:
     )
 
 
-def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, progress=gr.Progress()):
-    if (source_mode == 'upload' and not uploaded_video) or (source_mode == 'folder' and not input_video):
-        return None, None, [], [], 'Entire scene selected', gr.update(visible=False)
-    progress(0, desc='Finding people in the video')
-    source = _resolve_source(source_mode, uploaded_video, input_video)
-    scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26n.pt'), yolo_device, float(confidence))
+def _source_key(source_mode, uploaded_video, input_video):
+    """Identify the video currently chosen in the UI (before any copy into input/)."""
+    if source_mode == 'upload':
+        return ('upload', str(uploaded_video)) if uploaded_video else None
+    return ('folder', str(input_video)) if input_video else None
+
+
+def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, cache,
+                     progress=gr.Progress()):
+    cache = dict(cache or {})
+    empty = (None, None, [], [], 'Entire scene selected', gr.update(visible=False), cache)
+    key = _source_key(source_mode, uploaded_video, input_video)
+    if key is None:
+        return empty
+    # Same video and same scan settings -> reuse the scan instead of copying and rescanning.
+    cache_key = (*key, str(yolo_device), float(confidence))
+    scan = cache.get(cache_key)
+    if scan is None:
+        try:
+            progress(0, desc='Finding people in the video')
+            source = _resolve_source(source_mode, uploaded_video, input_video)
+            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26n.pt'), yolo_device, float(confidence))
+        except Exception as error:
+            # Clear the scan so Analyze can never fall back to the previous video.
+            gr.Warning(f'Subject preview failed: {error}')
+            return empty
+        scan['origin'] = key
+        cache[cache_key] = scan
+        while len(cache) > SCAN_CACHE_SIZE:
+            cache.pop(next(iter(cache)))
     recommended = [track for track in scan['tracks'] if track['recommended']][:5]
     shown_ids = {track['id'] for track in recommended}
     more = [track for track in scan['tracks'] if track['id'] not in shown_ids]
@@ -273,7 +298,8 @@ def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, conf
     scan['more_ids'] = [track['id'] for track in more]
     def gallery_items(tracks):
         return [(track['preview'], f"Person {track['id']} · {track['seconds']:.1f}s") for track in tracks]
-    return scan, None, gallery_items(recommended), gallery_items(more), 'Entire scene selected', gr.update(visible=bool(more))
+    return (scan, None, gallery_items(recommended), gallery_items(more), 'Entire scene selected',
+            gr.update(visible=bool(more)), cache)
 
 
 def select_subject(scan, group, evt: gr.SelectData):
@@ -326,8 +352,12 @@ def analyze_video(
             raise ValueError("Choose a valid ranking preference.")
 
         progress(0.04, desc="Preparing video")
-        if scan is None:
-            raise ValueError('Choose a video and wait for its subject preview.')
+        current = _source_key(source_mode, uploaded_video, input_video)
+        if current is None:
+            raise ValueError('Choose a video before starting the analysis.')
+        if scan is None or scan.get('origin') != current:
+            raise ValueError('The subject preview for this video is not ready. '
+                             'Wait for it to finish (or reselect the video), then try again.')
         source = Path(scan['source'])
         args = argparse.Namespace(
             input=str(source),
@@ -392,6 +422,7 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="Video Moment Finder", fill_width=True) as app:
         source_mode = gr.State("upload")
         scan_state = gr.State(None)
+        scan_cache = gr.State({})
         selected_subject = gr.State(None)
         gr.Markdown(
             "# Video Moment Finder\nUpload or select a video, then find its best-looking moments.",
@@ -449,7 +480,7 @@ def build_app() -> gr.Blocks:
                     sample_seconds = gr.Number(value=0.333, minimum=0.05, label="Sample interval (seconds)")
                     top_k = gr.Number(value=5, minimum=1, precision=0, label="Top K")
                 with gr.Row():
-                    min_gap = gr.Number(value=0.2, minimum=0, label="Minimum gap (seconds)")
+                    min_gap = gr.Number(value=0.5, minimum=0, label="Minimum gap (seconds)")
                     max_seconds = gr.Textbox(
                         value="",
                         label="Max seconds (optional)",
@@ -483,11 +514,21 @@ def build_app() -> gr.Blocks:
         folder_tab.select(lambda: "folder", outputs=source_mode, queue=False)
         refresh_button.click(refresh_input_choices, outputs=input_video, queue=False)
         preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section]
-        uploaded_video.change(lambda video, device, conf: preview_subjects('upload', video, None, device, conf),
-                              inputs=[uploaded_video, yolo_device, confidence], outputs=preview_outputs)
-        input_video.change(lambda video, device, conf: preview_subjects('folder', None, video, device, conf),
-                           inputs=[input_video, yolo_device, confidence], outputs=preview_outputs)
-        upload_tab.select(lambda video, device, conf: preview_subjects('upload', video, None, device, conf), inputs=[uploaded_video, yolo_device, confidence], outputs=preview_outputs)
+        preview_inputs = [yolo_device, confidence, scan_cache]
+
+        def preview_upload(video, device, conf, cache, progress=gr.Progress()):
+            return preview_subjects('upload', video, None, device, conf, cache, progress)
+
+        def preview_folder(video, device, conf, cache, progress=gr.Progress()):
+            return preview_subjects('folder', None, video, device, conf, cache, progress)
+
+        uploaded_video.change(preview_upload, inputs=[uploaded_video, *preview_inputs],
+                              outputs=preview_outputs + [scan_cache])
+        input_video.change(preview_folder, inputs=[input_video, *preview_inputs],
+                           outputs=preview_outputs + [scan_cache])
+        # Returning to the upload tab reuses the cached scan instead of copying and rescanning.
+        upload_tab.select(preview_upload, inputs=[uploaded_video, *preview_inputs],
+                          outputs=preview_outputs + [scan_cache])
         folder_tab.select(lambda: (None, None, [], [], 'Entire scene selected', gr.update(visible=False), None),
                           outputs=preview_outputs + [input_video], queue=False)
         subjects.select(select_recommended, inputs=[scan_state], outputs=[selected_subject, subject_label])

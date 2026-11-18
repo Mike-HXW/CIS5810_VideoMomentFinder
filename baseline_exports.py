@@ -5,6 +5,8 @@ import re
 import shutil
 import subprocess
 
+import cv2
+
 
 def ffmpeg_thumbnail(source, destination, frame_count):
     """Choose a representative frame from regularly spaced samples of the full video."""
@@ -50,8 +52,12 @@ def ffmpeg_thumbnail(source, destination, frame_count):
             'batch_size': batch_size, 'scope': 'whole_video'}
 
 
-def save_baselines(source, output, candidates, frame_count):
-    """Reuse the existing aesthetic scores and export one image per method."""
+def save_baselines(source, output, candidates, frame_count, frames=None):
+    """Reuse the existing aesthetic scores and export one image per method.
+
+    ``frames`` maps frame index -> full-quality decoded frame; when the top frame is
+    available it is written as PNG (candidate images themselves are JPEG previews).
+    """
     aesthetic_path = 'baselines/aesthetic_only/top_1.png'
     ffmpeg_path = 'baselines/ffmpeg_thumbnail/top_1.png'
     (output / aesthetic_path).parent.mkdir(parents=True)
@@ -59,7 +65,12 @@ def save_baselines(source, output, candidates, frame_count):
 
     # Use the raw score: percentile clipping can tie different aesthetic scores.
     top = min(candidates, key=lambda candidate: (-candidate['aesthetic_score'], candidate['frame_index']))
-    shutil.copy2(output / top['image'], output / aesthetic_path)
+    frame = (frames or {}).get(top['frame_index'])
+    if frame is not None:
+        if not cv2.imwrite(str(output / aesthetic_path), frame):
+            raise OSError(f'Cannot save {aesthetic_path}')
+    else:
+        shutil.copy2(output / top['image'], output / aesthetic_path)
     results = {'aesthetic_only': {
         'image': aesthetic_path, 'frame_index': top['frame_index'],
         'timestamp_seconds': top['timestamp_seconds'], 'aesthetic_score': top['aesthetic_score'],

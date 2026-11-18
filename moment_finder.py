@@ -6,7 +6,6 @@ import csv
 import html
 import json
 import math
-import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +15,11 @@ from PIL import Image
 
 from baseline_exports import save_baselines
 from human_detector import HumanDetector, INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
-from target_metrics import PRESET_WEIGHTS, score_candidates
+from target_metrics import PRESET_WEIGHTS, score_candidates, tenengrad_sharpness
+
+# Scores are computed from the decoded frame in memory, so candidate images are only for
+# viewing and are stored as high-quality JPEG to save disk space. Final picks stay PNG.
+CANDIDATE_JPEG_QUALITY = 95
 
 
 def select_best(candidates, top_k, min_gap):
@@ -71,12 +74,49 @@ class AestheticScorer:
 
     def score(self, path):
         with Image.open(path) as image:
-            pixels = self.processor(images=image.convert('RGB'), return_tensors='pt').pixel_values
+            return self._score_image(image.convert('RGB'), path)
+
+    def score_frame(self, frame, label):
+        """Score an in-memory BGR frame; identical pixels to scoring its lossless PNG."""
+        return self._score_image(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)), label)
+
+    def _score_image(self, image, label):
+        pixels = self.processor(images=image, return_tensors='pt').pixel_values
         with torch.inference_mode():
             score = self.model(pixels.to(self.device, dtype=torch.float32)).logits.squeeze().item()
         if not math.isfinite(score):
-            raise ValueError(f'Non-finite aesthetic score for {path}')
+            raise ValueError(f'Non-finite aesthetic score for {label}')
         return score
+
+
+def write_image(path, frame, jpeg=False):
+    params = [cv2.IMWRITE_JPEG_QUALITY, CANDIDATE_JPEG_QUALITY] if jpeg else []
+    if not cv2.imwrite(str(path), frame, params):
+        raise OSError(f'Cannot save {path}')
+
+
+def read_frames(source, frame_indices):
+    """Decode the requested frames again in one sequential pass.
+
+    Sequential grab() numbers frames exactly like the tracking pass (seeking may not).
+    """
+    wanted = set(frame_indices)
+    frames = {}
+    if not wanted:
+        return frames
+    last = max(wanted)
+    capture = cv2.VideoCapture(str(source))
+    try:
+        index = 0
+        while index <= last and capture.grab():
+            if index in wanted:
+                ok, frame = capture.retrieve()
+                if ok:
+                    frames[index] = frame
+            index += 1
+    finally:
+        capture.release()
+    return frames
 
 
 def run(args):
@@ -116,6 +156,7 @@ def run(args):
             model_path = PROJECT_DIR / model_path
         detector = None if scene or scan is not None else HumanDetector(model=str(model_path), confidence=args.confidence, device=args.device)
         target_id = args.target_id
+        scorer = None  # Loaded on the first candidate, as before (no candidates -> no model load).
         candidates = []
         target_presence = []
         frame_index = 0
@@ -163,17 +204,25 @@ def run(args):
                 if scene or target is not None:
                     target_frames += int(target is not None)
                     if timestamp + 1e-9 >= next_sample_time:
-                        filename = f'candidates/frame_{frame_index:07d}.png'
-                        if not cv2.imwrite(str(output / filename), frame):
-                            raise OSError(f'Cannot save {filename}')
+                        filename = f'candidates/frame_{frame_index:07d}.jpg'
+                        write_image(output / filename, frame, jpeg=True)
                         if scene:
-                            candidates.append({'frame_index': frame_index, 'timestamp_seconds': timestamp,
-                                               'image': filename})
+                            candidate = {'frame_index': frame_index, 'timestamp_seconds': timestamp,
+                                         'image': filename}
+                            bbox = [0, 0, frame_width, frame_height]
                         else:
-                            target_filename = f'candidates_target/frame_{frame_index:07d}.png'
-                            if not cv2.imwrite(str(output / target_filename), draw_target(frame, target)):
-                                raise OSError(f'Cannot save {target_filename}')
-                            candidates.append({**target, 'image': filename, 'target_image': target_filename})
+                            target_filename = f'candidates_target/frame_{frame_index:07d}.jpg'
+                            write_image(output / target_filename, draw_target(frame, target), jpeg=True)
+                            candidate = {**target, 'image': filename, 'target_image': target_filename}
+                            bbox = [target[key] for key in ('x1', 'y1', 'x2', 'y2')]
+                        # Score the decoded frame itself, not the stored JPEG, so scores are unchanged.
+                        candidate['sharpness_raw'] = tenengrad_sharpness(frame, bbox)
+                        if scorer is None:
+                            scorer = AestheticScorer(args.aesthetic_device)
+                        candidate['aesthetic_score'] = scorer.score_frame(frame, f'frame {frame_index}')
+                        print(f'Aesthetic {len(candidates) + 1}: frame {frame_index}, {timestamp:.2f}s, '
+                              f'raw {candidate["aesthetic_score"]:.3f}', flush=True)
+                        candidates.append(candidate)
                         next_sample_time = timestamp + args.sample_seconds
                 frame_index += 1
                 if frame_index % max(1, round(fps * 2)) == 0:
@@ -196,12 +245,6 @@ def run(args):
     if not candidates:
         raise ValueError(f'No candidate frames for target {target_id}. See {output / "tracks.csv"}.')
 
-    scorer = AestheticScorer(args.aesthetic_device)
-    for index, candidate in enumerate(candidates, 1):
-        candidate['aesthetic_score'] = scorer.score(output / candidate['image'])
-        print(f'Aesthetic {index}/{len(candidates)}: frame {candidate["frame_index"]}, '
-              f'{candidate["timestamp_seconds"]:.2f}s, '
-              f'raw {candidate["aesthetic_score"]:.3f}', flush=True)
     weights = score_candidates(
         candidates=candidates,
         output_dir=output,
@@ -225,14 +268,21 @@ def run(args):
     ]
     save_csv(output / 'scores.csv', sorted(candidates, key=lambda c: -c['score']), fields)
     best = select_best(candidates, args.top_k, args.min_gap)
+    # Re-decode the selected frames (and the aesthetic-only baseline) at full quality.
+    aesthetic_top = min(candidates, key=lambda c: (-c['aesthetic_score'], c['frame_index']))
+    full_frames = read_frames(source, [c['frame_index'] for c in best] + [aesthetic_top['frame_index']])
+    for candidate in best + [aesthetic_top]:
+        if candidate['frame_index'] not in full_frames:
+            raise OSError(f'Cannot re-decode frame {candidate["frame_index"]} from {source}')
     cards = []
     for rank, candidate in enumerate(best, 1):
+        frame = full_frames[candidate['frame_index']]
         filename = f'best/{rank:02d}_frame_{candidate["frame_index"]:07d}.png'
-        shutil.copy2(output / candidate['image'], output / filename)
+        write_image(output / filename, frame)
         target_filename = ''
         if not scene:
             target_filename = f'best_target/{rank:02d}_frame_{candidate["frame_index"]:07d}.png'
-            shutil.copy2(output / candidate['target_image'], output / target_filename)
+            write_image(output / target_filename, draw_target(frame, candidate))
         candidate = {**candidate, 'rank': rank, 'image': filename, 'target_image': target_filename}
         best[rank - 1] = candidate
         cards.append(f'<figure><a href="{filename}"><img src="{filename}" alt="Rank {rank}"></a>'
@@ -254,7 +304,7 @@ def run(args):
         f'<p>Ranking: {"Scene" if scene else html.escape(ranking_preset)}.</p><main>'
         + ''.join(cards) + '</main></html>', encoding='utf-8',
     )
-    baselines = save_baselines(source, output, candidates, source_frame_count)
+    baselines = save_baselines(source, output, candidates, source_frame_count, full_frames)
     summary.update(status='complete', selected_count=len(best), metric_weights=weights,
                    baselines=baselines)
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
