@@ -25,6 +25,18 @@ python -m pip install -e .\external\aesthetic-predictor-v2-5
 The first run may download model weights. `imageio-ffmpeg` provides FFmpeg for
 the thumbnail baseline on Windows.
 
+### GPU (optional)
+
+On Windows, pip installs the CPU-only PyTorch build, so the GPU options in the
+app cannot be used. With an NVIDIA GPU, install the CUDA build after the
+requirements. Pick the index URL that matches your driver at
+<https://pytorch.org/get-started/locally/>; this project was tested with CUDA 13.0:
+
+```powershell
+python -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu130
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
 ## Command line
 
 Put `test.mp4` in `input/` or pass a path to your video.
@@ -47,6 +59,11 @@ Each ranking run writes to `output/<video>_moments_<timestamp>/` by default.
 Open `index.html` for the ranked gallery, or find the selected images in
 `best/` and their scores in `best_frames.csv`.
 
+- `best/` and `best_target/` are full-quality PNGs of the selected frames.
+  The sampled frames in `candidates/` and `candidates_target/` are JPEG previews
+  to save disk space; all scores are computed from the decoded frames, not from
+  these previews.
+
 - `baselines/aesthetic_only/top_1.png` is the tracked candidate with the highest
   raw aesthetic score. It reuses the scores computed for the main ranking.
 - `baselines/ffmpeg_thumbnail/top_1.png` is a representative frame selected
@@ -64,3 +81,13 @@ person or keep **Entire scene**, then click **Analyze video**. For a selected
 person, choose **Balanced**, **Clear subject**, **Subject fully shown**, or
 **Best-looking scene**. The gallery shows frames, timestamps, scores, and the
 output folder.
+
+## Tests and checks
+
+```powershell
+python -m unittest discover -s tests
+python scripts/check_aesthetic.py path\to\image.jpg
+```
+
+`scripts/check_aesthetic.py` is a manual check that prints the aesthetic score
+of one image (default `input/person.jpg`); it loads the full model.
