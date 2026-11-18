@@ -41,6 +41,10 @@ def save_csv(path, rows, fields):
         writer.writerows(rows)
 
 
+def _area(box):
+    return (box['x2'] - box['x1']) * (box['y2'] - box['y1'])
+
+
 def draw_target(frame, target):
     """Annotate a copy; never modify the original frame used for scoring."""
     annotated = frame.copy()
@@ -168,7 +172,11 @@ def run(args):
         if not model_path.is_absolute() and (PROJECT_DIR / model_path).is_file():
             model_path = PROJECT_DIR / model_path
         detector = None if scene or scan is not None else HumanDetector(model=str(model_path), confidence=args.confidence, device=args.device)
-        target_id = args.target_id
+        # One ID, or several IDs chosen together in the app (one person split at hard cuts).
+        target_ids = args.target_id
+        if target_ids is not None and not isinstance(target_ids, (list, tuple, set)):
+            target_ids = [target_ids]
+        target_ids = set(target_ids) if target_ids is not None else None
         scorer = None  # Loaded on the first candidate, as before (no candidates -> no model load).
         candidates = []
         target_presence = []
@@ -205,13 +213,16 @@ def run(args):
                             people.append(dict(frame_index=frame_index, timestamp_seconds=timestamp,
                                                track_id=track_id, x1=x1, y1=y1, x2=x2, y2=y2,
                                                confidence=confidence))
-                if not scene and target_id is None and people:
-                    target_id = max(people, key=lambda p: (p['x2']-p['x1'])*(p['y2']-p['y1']))['track_id']
-                    print(f'Locked target ID {target_id} (largest person at first detection).', flush=True)
+                if not scene and target_ids is None and people:
+                    locked = max(people, key=lambda p: (p['x2']-p['x1'])*(p['y2']-p['y1']))['track_id']
+                    target_ids = {locked}
+                    print(f'Locked target ID {locked} (largest person at first detection).', flush=True)
                 target = None
                 for person in people:
-                    writer.writerow({**person, 'is_target': person['track_id'] == target_id})
-                    if person['track_id'] == target_id:
+                    is_target = target_ids is not None and person['track_id'] in target_ids
+                    writer.writerow({**person, 'is_target': is_target})
+                    # If two chosen IDs share a frame, follow the larger box.
+                    if is_target and (target is None or _area(person) > _area(target)):
                         target = person
                 target_presence.append(target is not None)
                 if scene or target is not None:
@@ -243,10 +254,11 @@ def run(args):
         capture.release()
 
     ranking_preset = getattr(args, 'ranking_preset', 'balanced')
+    target_label = ', '.join(map(str, sorted(target_ids))) if target_ids else 'none'
     summary = dict(source=str(source), fps=fps, frame_width=frame_width,
                    frame_height=frame_height, frame_index_base=0,
                    timestamp_method='frame_index / fps (constant-frame-rate assumption)',
-                   processed_frames=frame_index, target_id=target_id, target_visible_frames=target_frames,
+                   processed_frames=frame_index, target_id=sorted(target_ids) if target_ids else None, target_visible_frames=target_frames,
                    sample_seconds=args.sample_seconds, min_gap_seconds=args.min_gap,
                    requested_top_k=args.top_k, candidate_count=len(candidates),
                    ranking_preset='scene' if scene else ranking_preset, mode='scene' if scene else 'subject',
@@ -255,7 +267,7 @@ def run(args):
     summary_path = output / 'summary.json'
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
     if not candidates:
-        raise ValueError(f'No candidate frames for target {target_id}. See {output / "tracks.csv"}.')
+        raise ValueError(f'No candidate frames for target {target_label}. See {output / "tracks.csv"}.')
 
     weights = score_candidates(
         candidates=candidates,
@@ -304,15 +316,15 @@ def run(args):
                      + (f'Visibility {candidate["visibility_score"]:.3f} · '
                         f'Composition {candidate["composition_score"]:.3f} · ' if not scene else '') +
                      f'{candidate["timestamp_seconds"]:.2f}s · Frame {candidate["frame_index"]}'
-                     + (f' · Person ID {target_id}' if not scene else '') + '</figcaption>'
-                     + (f'<details><summary>Show target box</summary><a href="{target_filename}"><img src="{target_filename}" alt="Target ID {target_id}"></a></details>' if not scene else '') + '</figure>')
+                     + (f' · Person ID {target_label}' if not scene else '') + '</figcaption>'
+                     + (f'<details><summary>Show target box</summary><a href="{target_filename}"><img src="{target_filename}" alt="Target ID {target_label}"></a></details>' if not scene else '') + '</figure>')
     save_csv(output / 'best_frames.csv', best, ['rank'] + fields)
     (output / 'index.html').write_text(
         '<!doctype html><html lang="en"><meta charset="utf-8"><title>Video Moment Finder</title>'
         '<style>body{font:16px system-ui;margin:32px;background:#f4f4f4} '
         'main{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}'
         'figure{margin:0;background:white;padding:12px}img{width:100%}figcaption{padding:12px 0}</style>'
-        f'<h1>Best Video Moments</h1><p>{html.escape(source.name)} · {"Entire scene" if scene else f"Target ID {target_id}"}</p>'
+        f'<h1>Best Video Moments</h1><p>{html.escape(source.name)} · {"Entire scene" if scene else f"Target ID {target_label}"}</p>'
         f'<p>Ranking: {"Scene" if scene else html.escape(ranking_preset)}.</p><main>'
         + ''.join(cards) + '</main></html>', encoding='utf-8',
     )

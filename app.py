@@ -200,17 +200,24 @@ def reset_subjects():
     return None, None, [], [], SCENE_LABEL, gr.update(visible=False)
 
 
-def select_subject(scan, group, evt: gr.SelectData):
-    track_id = scan[group][evt.index]
-    return track_id, f'Person {track_id} selected'
+def select_subject(scan, chosen, group, evt: gr.SelectData):
+    """Clicking a person adds or removes them; several entries are treated as one subject
+    (tracks are split at hard cuts, so one person can appear as several entries)."""
+    person_id = scan[group][evt.index]
+    chosen = [p for p in (chosen or []) if p != person_id] + ([] if person_id in (chosen or []) else [person_id])
+    if not chosen:
+        return None, SCENE_LABEL
+    names = ' + '.join(f'Person {p}' for p in chosen)
+    hint = ' (treated as one person)' if len(chosen) > 1 else ''
+    return chosen, f'{names} selected{hint} · click again to remove'
 
 
-def select_recommended(scan, evt: gr.SelectData):
-    return select_subject(scan, 'recommended_ids', evt)
+def select_recommended(scan, chosen, evt: gr.SelectData):
+    return select_subject(scan, chosen, 'recommended_ids', evt)
 
 
-def select_more(scan, evt: gr.SelectData):
-    return select_subject(scan, 'more_ids', evt)
+def select_more(scan, chosen, evt: gr.SelectData):
+    return select_subject(scan, chosen, 'more_ids', evt)
 
 
 def analyze_video(
@@ -268,7 +275,7 @@ def analyze_video(
             device=yolo_device,
             aesthetic_device=aesthetic_device,
             confidence=confidence,
-            target_id=selected_subject,
+            target_id=None if scene else sorted(selected_subject),
             scene=scene,
             scan=scan,
             sample_seconds=sample_seconds,
@@ -416,8 +423,8 @@ def build_app() -> gr.Blocks:
             inputs=[source_mode, uploaded_video, input_video, yolo_device, confidence, scan_cache],
             outputs=preview_outputs + [scan_cache],
         )
-        subjects.select(select_recommended, inputs=[scan_state], outputs=[selected_subject, subject_label])
-        more_subjects.select(select_more, inputs=[scan_state], outputs=[selected_subject, subject_label])
+        subjects.select(select_recommended, inputs=[scan_state, selected_subject], outputs=[selected_subject, subject_label])
+        more_subjects.select(select_more, inputs=[scan_state, selected_subject], outputs=[selected_subject, subject_label])
         # Keeps the people list so the user can switch back to a person.
         entire_scene.click(lambda: (None, SCENE_LABEL), outputs=[selected_subject, subject_label], queue=False)
         analyze_button.click(
