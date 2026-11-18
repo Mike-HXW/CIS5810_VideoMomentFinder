@@ -205,15 +205,15 @@ def score_candidates(
     # Inspect target presence within 0.5s
     stability_window_frames = max(1, round(fps * 0.5))
     for candidate in candidates:
-        # load the original frame + recover the tracked subject bounding box
-        image_path = output_dir / candidate["image"]
-        frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise OSError(f"Cannot read candidate image for metrics: {image_path}")
         bbox = [0, 0, frame_width, frame_height] if scene else [candidate[key] for key in ("x1", "y1", "x2", "y2")]
 
-        # sobel gradient
-        candidate["sharpness_raw"] = tenengrad_sharpness(frame, bbox)
+        # sobel gradient; callers may precompute it from the in-memory frame
+        if "sharpness_raw" not in candidate:
+            image_path = output_dir / candidate["image"]
+            frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise OSError(f"Cannot read candidate image for metrics: {image_path}")
+            candidate["sharpness_raw"] = tenengrad_sharpness(frame, bbox)
         if scene:
             continue
         stability = track_stability_for_frame(
