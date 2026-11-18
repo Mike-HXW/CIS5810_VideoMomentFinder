@@ -6,7 +6,6 @@ import csv
 import html
 import math
 import shutil
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -15,7 +14,7 @@ import torch
 
 from human_detector import INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
 from moment_finder import run
-from subject_preview import ScanCancelled, scan_subjects
+from subject_preview import scan_subjects
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -28,21 +27,8 @@ PRESET_CHOICES = [
 PRESET_LABELS = {value: label for label, value in PRESET_CHOICES}
 SCAN_CACHE_SIZE = 2  # Enough for one upload plus one input-folder video per session.
 SCENE_LABEL = 'Entire scene selected'
-SCAN_STOPPED_LABEL = ('Entire scene selected · person scan stopped '
-                      '(use "Scan for people" to pick a person)')
-# Per browser session: a flag that asks the running person scan to stop.
-_SCAN_STOPS: dict[str, threading.Event] = {}
 # Uploaded temp file -> its copy in input/, so each upload is copied only once.
 _UPLOAD_COPIES: dict[str, Path] = {}
-
-
-def _stop_scan(request: gr.Request | None) -> bool:
-    """Ask this session's running person scan to stop; return True if one was running."""
-    stop = _SCAN_STOPS.get(request.session_hash) if request is not None else None
-    if stop is None:
-        return False
-    stop.set()
-    return True
 SCORE_HEADERS = [
     "Rank", "Timestamp", "Frame", "Final", "Aesthetic",
     "Sharpness", "Visibility", "Composition",
@@ -50,133 +36,18 @@ SCORE_HEADERS = [
 
 
 APP_CSS = """
-:root {
-  --vmf-ink: #10213f;
-  --vmf-muted: #64748b;
-  --vmf-line: #dbe4f0;
-  --vmf-panel: #f7faff;
-  --vmf-accent: #0f67ff;
-}
-.gradio-container {
-  max-width: 1500px !important;
-  margin: 0 auto !important;
-  padding: 28px 24px 36px !important;
-  color: var(--vmf-ink) !important;
-  --block-label-text-color: #000000 !important;
-  --block-label-text-color-dark: #000000 !important;
-}
-#vmf-header { margin-bottom: 18px; }
-#vmf-header h1 {
-  color: var(--vmf-ink);
-  font-size: clamp(2rem, 3vw, 3rem);
-  letter-spacing: -0.045em;
-  line-height: 1.05;
-  margin: 0 0 8px;
-}
-#vmf-header p { color: var(--vmf-muted); font-size: 1.05rem; margin: 0; }
-#control-panel, #results-panel {
-  background: var(--vmf-panel);
-  border: 1px solid var(--vmf-line);
-  border-radius: 14px;
-  padding: 16px;
-}
-#control-panel { align-self: flex-start; }
-#control-panel .tabs { background: transparent; }
-#ranking-preset { margin: 14px 0 4px; }
-#ranking-preset label { color: #000000 !important; }
-[role="listbox"] {
-  background: #ffffff !important;
-  border: 1px solid #cbd8e8 !important;
-  color: var(--vmf-ink) !important;
-}
-[data-testid="dropdown-option"] {
-  background: #ffffff !important;
-  color: var(--vmf-ink) !important;
-}
-[data-testid="dropdown-option"].selected,
-[data-testid="dropdown-option"]:hover {
-  background: #eaf2ff !important;
-  color: var(--vmf-ink) !important;
-}
-/* Gradio adds Tailwind's dark:bg-gray-600 to selected dropdown rows. */
-html body .gradio-container ul.option-list li[data-testid="dropdown-option"].item.selected.active.bg-gray-100.dark\\:bg-gray-600,
-html body .gradio-container ul.option-list li[data-testid="dropdown-option"].item {
-  background: #eaf2ff !important;
-  color: var(--vmf-ink) !important;
-}
-html body .gradio-container ul.option-list li[data-testid="dropdown-option"]:not(.selected) {
-  background: #ffffff !important;
-}
-#control-panel label,
-#control-panel label span,
-#control-panel [data-testid="block-label"],
-#control-panel [data-testid="block-label"] *,
-#control-panel [data-testid="block-info"],
-#control-panel .block-label,
-#control-panel .label,
-#results-panel label,
-#results-panel label span,
-#results-panel .block-label {
-  color: #000000 !important;
-  opacity: 1 !important;
-}
-#analyze-button {
-  background: var(--vmf-accent) !important;
-  border: 0 !important;
-  color: #fff !important;
-  min-height: 48px;
-  font-size: 1rem;
-  font-weight: 700;
-}
-#results-heading h2 { color: var(--vmf-ink); margin: 0 0 8px; }
-.vmf-empty {
-  border: 1px dashed #c8d5e6;
-  border-radius: 12px;
-  color: var(--vmf-muted);
-  padding: 44px 24px;
-  text-align: center;
-}
-.vmf-success {
-  background: #eaf9f0;
-  border: 1px solid #bce8cb;
-  border-radius: 10px;
-  color: #17653a;
-  padding: 12px 14px;
-}
-.vmf-success strong { color: #0d512d; }
-#moments-gallery { background: #fff; border-color: var(--vmf-line); }
-#moments-gallery .caption-label {
-  background: rgba(15, 23, 42, 0.92) !important;
-  color: #ffffff !important;
-}
-#moments-table { background: #fff; }
-.vmf-score-title { color: #000000; font-size: 0.9rem; margin: 0 0 8px; }
-.vmf-score-table {
-  border: 1px solid var(--vmf-line);
-  border-collapse: separate;
-  border-radius: 10px;
-  border-spacing: 0;
-  overflow: hidden;
-  width: 100%;
-  font-size: 0.88rem;
-}
-.vmf-score-table th, .vmf-score-table td {
-  border-bottom: 1px solid var(--vmf-line);
-  color: var(--vmf-ink);
-  padding: 10px 12px;
-  text-align: left;
-}
-.vmf-score-table th { background: #eef4fb; font-size: 0.82rem; }
-.vmf-score-table td { background: #ffffff; }
-.vmf-score-table tr:last-child td { border-bottom: 0; }
-@media (max-width: 900px) {
-  .vmf-score-table { display: block; overflow-x: auto; white-space: nowrap; }
-}
-@media (max-width: 900px) {
-  .gradio-container { padding: 18px 12px 28px !important; }
-  #control-panel, #results-panel { padding: 12px; }
-}
+.gradio-container { max-width: 1500px !important; margin: 0 auto !important; }
+#control-panel, #results-panel { border: 1px solid #dbe4f0; border-radius: 14px; padding: 16px; }
+.vmf-empty { border: 1px dashed #c8d5e6; border-radius: 12px; color: #64748b; padding: 44px 24px; text-align: center; }
+.vmf-success { background: #eaf9f0; border: 1px solid #bce8cb; border-radius: 10px; color: #17653a; padding: 12px 14px; }
+.vmf-score-title { font-size: 0.9rem; margin: 0 0 8px; }
+.vmf-score-table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+.vmf-score-table th, .vmf-score-table td { border-bottom: 1px solid #dbe4f0; padding: 8px 10px; text-align: left; }
+.vmf-score-table th { background: #eef4fb; }
+@media (max-width: 900px) { .vmf-score-table { display: block; overflow-x: auto; white-space: nowrap; } }
 """
+# Keep the page in light mode even when the OS uses dark mode, so no dark-mode overrides are needed.
+FORCE_LIGHT_JS = "() => document.body.classList.remove('dark')"
 
 
 def list_input_videos() -> list[str]:
@@ -290,38 +161,25 @@ def _source_key(source_mode, uploaded_video, input_video):
     return ('folder', str(input_video)) if input_video else None
 
 
-def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, cache,
-                     progress=gr.Progress(), request: gr.Request | None = None):
+def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, cache):
+    """Scan the chosen video for people (runs when the user clicks Find people)."""
     cache = dict(cache or {})
-    empty = (None, None, [], [], SCENE_LABEL, gr.update(visible=False), gr.update(visible=False), cache)
+    empty = (None, None, [], [], SCENE_LABEL, gr.update(visible=False), cache)
     key = _source_key(source_mode, uploaded_video, input_video)
     if key is None:
+        gr.Warning('Choose a video first.')
         return empty
     # Same video and same scan settings -> reuse the scan instead of copying and rescanning.
     cache_key = (*key, str(yolo_device), float(confidence))
     scan = cache.get(cache_key)
     if scan is None:
-        session = request.session_hash if request is not None else None
-        _stop_scan(request)  # A new scan replaces any older one still running in this session.
-        stop = threading.Event()
-        if session is not None:
-            _SCAN_STOPS[session] = stop
         try:
-            progress(0, desc='Finding people in the video')
             source = _resolve_source(source_mode, uploaded_video, input_video)
-            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26s.pt'), yolo_device, float(confidence),
-                                 should_stop=stop.is_set)
-        except ScanCancelled:
-            # Offer a way back to person selection, since re-picking the same video fires no event.
-            return (None, None, [], [], SCAN_STOPPED_LABEL, gr.update(visible=False),
-                    gr.update(visible=True), cache)
+            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26s.pt'), yolo_device, float(confidence))
         except Exception as error:
             # Clear the scan so Analyze can never fall back to the previous video.
             gr.Warning(f'Subject preview failed: {error}')
             return empty
-        finally:
-            if session is not None and _SCAN_STOPS.get(session) is stop:
-                del _SCAN_STOPS[session]
         scan['origin'] = key
         cache[cache_key] = scan
         while len(cache) > SCAN_CACHE_SIZE:
@@ -334,19 +192,12 @@ def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, conf
     def gallery_items(tracks):
         return [(track['preview'], f"Person {track['id']} · {track['seconds']:.1f}s") for track in tracks]
     return (scan, None, gallery_items(recommended), gallery_items(more), SCENE_LABEL,
-            gr.update(visible=bool(more)), gr.update(visible=False), cache)
+            gr.update(visible=bool(more)), cache)
 
 
-def choose_entire_scene(source_mode, uploaded_video, input_video, scan, request: gr.Request | None = None):
-    """Select Entire scene; if the person scan is still running, stop it."""
-    stopped = _stop_scan(request)
-    current = _source_key(source_mode, uploaded_video, input_video)
-    if scan is not None and current is not None and scan.get('origin') == current:
-        # Scan already finished for this video: keep the people so the user can switch back.
-        return None, SCENE_LABEL, gr.update(), gr.update(), gr.update(), scan, gr.update(visible=False)
-    # No usable scan (stopped, or from another video): clear the people galleries.
-    return (None, SCAN_STOPPED_LABEL if stopped else SCENE_LABEL, [], [],
-            gr.update(visible=False), None, gr.update(visible=stopped))
+def reset_subjects():
+    """A new video (or source tab) starts as Entire scene with no people listed."""
+    return None, None, [], [], SCENE_LABEL, gr.update(visible=False)
 
 
 def select_subject(scan, group, evt: gr.SelectData):
@@ -376,8 +227,6 @@ def analyze_video(
     ranking_preset,
     scan,
     selected_subject,
-    progress=gr.Progress(),
-    request: gr.Request | None = None,
 ):
     """Run the existing pipeline and format its outputs for Gradio."""
     try:
@@ -399,21 +248,18 @@ def analyze_video(
         if ranking_preset not in PRESET_LABELS:
             raise ValueError("Choose a valid ranking preference.")
 
-        progress(0.04, desc="Preparing video")
         current = _source_key(source_mode, uploaded_video, input_video)
         if current is None:
             raise ValueError('Choose a video before starting the analysis.')
         scene = selected_subject is None
         if scene:
-            # Entire scene needs no person scan: stop one that may still be running.
-            _stop_scan(request)
+            # Entire scene needs no person scan; reuse a finished one's copied source if present.
             scan_ok = scan is not None and scan.get('origin') == current
             source = Path(scan['source']) if scan_ok else _resolve_source(source_mode, uploaded_video, input_video)
             scan = None
         else:
             if scan is None or scan.get('origin') != current:
-                raise ValueError('The subject preview for this video is not ready. '
-                                 'Wait for it to finish (or reselect the video), then try again.')
+                raise ValueError('Click "Find people" for this video and choose a person first.')
             source = Path(scan['source'])
         args = argparse.Namespace(
             input=str(source),
@@ -431,16 +277,13 @@ def analyze_video(
             max_seconds=max_seconds,
             ranking_preset=ranking_preset,
         )
-        progress(0.12, desc="Scoring candidate frames")
         output = Path(run(args)).resolve()
-        progress(0.96, desc="Loading selected moments")
         gallery, table = _load_results(output)
         status = (
             '<div class="vmf-success"><strong>Analysis complete.</strong> '
             f'Selected {len(gallery)} moment(s) from <code>{html.escape(source.name)}</code> '
             f'using <strong>{html.escape("Entire scene" if selected_subject is None else PRESET_LABELS[ranking_preset])}</strong>.</div>'
         )
-        progress(1.0, desc="Complete")
         return status, gallery, _score_table_html(table), str(output)
     except Exception as error:
         raise gr.Error(f"Analysis failed: {error}") from error
@@ -452,20 +295,10 @@ def build_theme():
         neutral_hue="slate",
         font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
     ).set(
-        body_background_fill="#ffffff",
-        body_background_fill_dark="#ffffff",
         body_text_color="#10213f",
-        body_text_color_dark="#10213f",
         block_background_fill="#f7faff",
-        block_background_fill_dark="#f7faff",
         block_border_color="#dbe4f0",
-        block_border_color_dark="#dbe4f0",
-        input_background_fill="#ffffff",
-        input_background_fill_dark="#ffffff",
         input_border_color="#cbd8e8",
-        input_border_color_dark="#cbd8e8",
-        input_placeholder_color="#94a3b8",
-        input_placeholder_color_dark="#94a3b8",
     )
 
 
@@ -504,10 +337,11 @@ def build_app() -> gr.Blocks:
                         refresh_button = gr.Button("Refresh input folder", variant="secondary")
 
                 gr.Markdown('### Choose a subject')
-                gr.Markdown('Choose a person or analyze the entire scene.')
-                entire_scene = gr.Button('Entire scene', variant='secondary')
+                gr.Markdown('Analyze the entire scene, or click Find people to choose a person.')
+                with gr.Row():
+                    entire_scene = gr.Button('Entire scene', variant='secondary')
+                    find_people = gr.Button('Find people', variant='secondary')
                 subject_label = gr.Markdown(SCENE_LABEL)
-                rescan_button = gr.Button('Scan for people', variant='secondary', size='sm', visible=False)
                 subjects = gr.Gallery(label='Recommended people', columns=5, height='auto', object_fit='contain', allow_preview=False)
                 with gr.Accordion('Show more', open=False, visible=False) as more_section:
                     more_subjects = gr.Gallery(label='More people', columns=5, height='auto', object_fit='contain', allow_preview=False)
@@ -537,7 +371,7 @@ def build_app() -> gr.Blocks:
                     sample_seconds = gr.Number(value=0.333, minimum=0.05, label="Sample interval (seconds)")
                     top_k = gr.Number(value=5, minimum=1, precision=0, label="Top K")
                 with gr.Row():
-                    min_gap = gr.Number(value=0.5, minimum=0, label="Minimum gap (seconds)")
+                    min_gap = gr.Number(value=0.333, minimum=0, label="Minimum gap (seconds)")
                     max_seconds = gr.Textbox(
                         value="",
                         label="Max seconds (optional)",
@@ -570,47 +404,22 @@ def build_app() -> gr.Blocks:
         upload_tab.select(lambda: "upload", outputs=source_mode, queue=False)
         folder_tab.select(lambda: "folder", outputs=source_mode, queue=False)
         refresh_button.click(refresh_input_choices, outputs=input_video, queue=False)
-        preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section,
-                           rescan_button]
-        preview_inputs = [yolo_device, confidence, scan_cache]
-
-        def preview_upload(video, device, conf, cache, request: gr.Request, progress=gr.Progress()):
-            return preview_subjects('upload', video, None, device, conf, cache, progress, request)
-
-        def preview_folder(video, device, conf, cache, request: gr.Request, progress=gr.Progress()):
-            return preview_subjects('folder', None, video, device, conf, cache, progress, request)
-
-        scan_events = [
-            uploaded_video.change(preview_upload, inputs=[uploaded_video, *preview_inputs],
-                                  outputs=preview_outputs + [scan_cache]),
-            input_video.change(preview_folder, inputs=[input_video, *preview_inputs],
-                               outputs=preview_outputs + [scan_cache]),
-            # Returning to the upload tab reuses the cached scan instead of copying and rescanning.
-            upload_tab.select(preview_upload, inputs=[uploaded_video, *preview_inputs],
-                              outputs=preview_outputs + [scan_cache]),
-        ]
-
-        def preview_current(mode, uploaded, folder, device, conf, cache, request: gr.Request,
-                            progress=gr.Progress()):
-            return preview_subjects(mode, uploaded, folder, device, conf, cache, progress, request)
-
-        scan_events.append(rescan_button.click(
-            preview_current, inputs=[source_mode, uploaded_video, input_video, *preview_inputs],
-            outputs=preview_outputs + [scan_cache]))
-        folder_tab.select(lambda: (None, None, [], [], SCENE_LABEL, gr.update(visible=False),
-                                   gr.update(visible=False), None),
-                          outputs=preview_outputs + [input_video], queue=False)
+        preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section]
+        # Choosing a video no longer scans; it just resets the subject choice to Entire scene.
+        uploaded_video.change(reset_subjects, outputs=preview_outputs, queue=False)
+        input_video.change(reset_subjects, outputs=preview_outputs, queue=False)
+        upload_tab.select(reset_subjects, outputs=preview_outputs, queue=False)
+        folder_tab.select(lambda: (*reset_subjects(), None), outputs=preview_outputs + [input_video], queue=False)
+        # The scan reuses the per-session cache, so clicking again for the same video is instant.
+        find_people.click(
+            preview_subjects,
+            inputs=[source_mode, uploaded_video, input_video, yolo_device, confidence, scan_cache],
+            outputs=preview_outputs + [scan_cache],
+        )
         subjects.select(select_recommended, inputs=[scan_state], outputs=[selected_subject, subject_label])
         more_subjects.select(select_more, inputs=[scan_state], outputs=[selected_subject, subject_label])
-        # Runs outside the queue so it responds even while a scan is running. It stops a
-        # running scan via the session flag; `cancels` also drops scans still waiting in the queue.
-        entire_scene.click(
-            choose_entire_scene,
-            inputs=[source_mode, uploaded_video, input_video, scan_state],
-            outputs=[selected_subject, subject_label, subjects, more_subjects, more_section, scan_state,
-                     rescan_button],
-            cancels=scan_events, queue=False,
-        )
+        # Keeps the people list so the user can switch back to a person.
+        entire_scene.click(lambda: (None, SCENE_LABEL), outputs=[selected_subject, subject_label], queue=False)
         analyze_button.click(
             analyze_video,
             inputs=[
@@ -635,4 +444,4 @@ def build_app() -> gr.Blocks:
 
 
 if __name__ == "__main__":
-    build_app().queue(default_concurrency_limit=1).launch(theme=build_theme(), css=APP_CSS)
+    build_app().queue(default_concurrency_limit=1).launch(theme=build_theme(), css=APP_CSS, js=FORCE_LIGHT_JS)
