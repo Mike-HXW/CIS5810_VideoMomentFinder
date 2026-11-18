@@ -72,6 +72,20 @@ class AestheticScorer:
         )
         self.model = self.model.to(device=device, dtype=torch.float32).eval()
 
+    _shared = {}
+
+    @classmethod
+    def shared(cls, device):
+        """Reuse the loaded model across runs (e.g. repeated Analyze clicks in the app).
+
+        Only one copy is kept: switching device frees the previous one. Scoring stays one
+        image at a time because batching changes scores slightly (~1e-6).
+        """
+        if device not in cls._shared:
+            cls._shared.clear()
+            cls._shared[device] = cls(device)
+        return cls._shared[device]
+
     def score(self, path):
         with Image.open(path) as image:
             return self._score_image(image.convert('RGB'), path)
@@ -218,7 +232,7 @@ def run(args):
                         # Score the decoded frame itself, not the stored JPEG, so scores are unchanged.
                         candidate['sharpness_raw'] = tenengrad_sharpness(frame, bbox)
                         if scorer is None:
-                            scorer = AestheticScorer(args.aesthetic_device)
+                            scorer = AestheticScorer.shared(args.aesthetic_device)
                         candidate['aesthetic_score'] = scorer.score_frame(frame, f'frame {frame_index}')
                         print(f'Aesthetic {len(candidates) + 1}: frame {frame_index}, {timestamp:.2f}s, '
                               f'raw {candidate["aesthetic_score"]:.3f}', flush=True)
@@ -319,7 +333,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input', help='Video filename in input/, or explicit path')
     parser.add_argument('--output', help='New output directory (must not already exist)')
-    parser.add_argument('--model', default='yolo26n.pt')
+    parser.add_argument('--model', default='yolo26s.pt')
     parser.add_argument('--device', default='cpu', help='YOLO device, e.g. cpu or mps')
     parser.add_argument('--aesthetic-device', default='cpu', choices=['cpu', 'mps', 'cuda'])
     parser.add_argument('--confidence', type=float, default=0.25)
