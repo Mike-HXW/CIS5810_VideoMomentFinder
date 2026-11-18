@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 
-from human_detector import HumanDetector
+from human_detector import HumanDetector, PROJECT_DIR
 
 
 def scan_subjects(source, model, device, confidence):
@@ -17,7 +17,7 @@ def scan_subjects(source, model, device, confidence):
         if not ok:
             break
         result = detector.model.track(
-            source=frame, persist=True, tracker='bytetrack.yaml',
+            source=frame, persist=True, tracker=str(PROJECT_DIR / 'botsort_reid.yaml'),
             classes=[detector.person_class_id], conf=confidence, device=device, verbose=False,
         )[0]
         height, width = frame.shape[:2]

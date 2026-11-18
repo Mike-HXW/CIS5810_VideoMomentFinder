@@ -138,7 +138,7 @@ def run(args):
                     people = [track['frames'][frame_index] for track in scan['tracks'] if frame_index in track['frames']]
                 elif not scene:
                     result = detector.model.track(
-                        source=frame, persist=True, tracker='bytetrack.yaml',
+                        source=frame, persist=True, tracker=str(PROJECT_DIR / 'botsort_reid.yaml'),
                         classes=[detector.person_class_id], conf=args.confidence,
                         device=args.device, verbose=False,
                     )[0]

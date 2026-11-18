@@ -1,9 +1,9 @@
 # Video Moment Finder
 
-Find the best still frames of a person in a video. YOLO and ByteTrack follow
-the largest person in the first frame with a tracked detection. Aesthetic
-Predictor V2.5 scores each candidate's overall look, and the ranking also
-considers subject sharpness, visibility, and composition.
+Find still frames in a video. YOLO26 detects people, while BoT-SORT with ReID
+tracks them for subject selection. Aesthetic Predictor V2.5 scores each
+candidate's overall look; subject rankings also consider sharpness,
+visibility, and composition.
 
 ## Setup (Windows)
 
@@ -37,6 +37,9 @@ python human_detector.py test.mp4
 `moment_finder.py` ranks frames. Use `--ranking-preset clear-subject` to give
 sharpness more weight, or `--help` for the other presets and settings.
 `human_detector.py` draws person boxes on an image or video.
+The command-line ranking defaults to tracking the largest person at the first
+detection. Tracking settings are in `botsort_reid.yaml`; ReID uses YOLO features
+when compatible (`with_reid: True`, `model: auto`).
 
 ## Outputs and baselines
 
@@ -56,6 +59,8 @@ Open `index.html` for the ranked gallery, or find the selected images in
 From the project folder with `.venv` active, run `python app.py` and open the
 URL printed in the terminal (normally `http://127.0.0.1:7860`).
 
-Upload a video or select one from `input/`. Choose **Balanced**, **Clear subject**,
-**Subject fully shown**, or **Best-looking scene**, then click **Analyze video**.
-The gallery shows the ranked frames, timestamps, scores, and output folder.
+Upload a video or select one from `input/`. After the subject scan, choose a
+person or keep **Entire scene**, then click **Analyze video**. For a selected
+person, choose **Balanced**, **Clear subject**, **Subject fully shown**, or
+**Best-looking scene**. The gallery shows frames, timestamps, scores, and the
+output folder.
