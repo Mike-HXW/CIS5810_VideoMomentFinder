@@ -6,6 +6,7 @@ import csv
 import html
 import math
 import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import torch
 
 from human_detector import INPUT_DIR, OUTPUT_DIR, PROJECT_DIR
 from moment_finder import run
-from subject_preview import scan_subjects
+from subject_preview import ScanCancelled, scan_subjects
 
 
 VIDEO_EXTENSIONS = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -26,6 +27,22 @@ PRESET_CHOICES = [
 ]
 PRESET_LABELS = {value: label for label, value in PRESET_CHOICES}
 SCAN_CACHE_SIZE = 2  # Enough for one upload plus one input-folder video per session.
+SCENE_LABEL = 'Entire scene selected'
+SCAN_STOPPED_LABEL = ('Entire scene selected · person scan stopped '
+                      '(use "Scan for people" to pick a person)')
+# Per browser session: a flag that asks the running person scan to stop.
+_SCAN_STOPS: dict[str, threading.Event] = {}
+# Uploaded temp file -> its copy in input/, so each upload is copied only once.
+_UPLOAD_COPIES: dict[str, Path] = {}
+
+
+def _stop_scan(request: gr.Request | None) -> bool:
+    """Ask this session's running person scan to stop; return True if one was running."""
+    stop = _SCAN_STOPS.get(request.session_hash) if request is not None else None
+    if stop is None:
+        return False
+    stop.set()
+    return True
 SCORE_HEADERS = [
     "Rank", "Timestamp", "Frame", "Final", "Aesthetic",
     "Sharpness", "Visibility", "Composition",
@@ -192,8 +209,13 @@ def _resolve_source(source_mode: str, uploaded_video: str | None, input_video: s
         uploaded_path = Path(uploaded_video)
         if not uploaded_path.is_file():
             raise FileNotFoundError(f"Uploaded video is unavailable: {uploaded_path}")
+        # One copy per upload, even if a stopped scan already copied it.
+        copied = _UPLOAD_COPIES.get(str(uploaded_path))
+        if copied is not None and copied.is_file():
+            return copied
         destination = INPUT_DIR / _safe_uploaded_name(uploaded_path)
         shutil.copy2(uploaded_path, destination)
+        _UPLOAD_COPIES[str(uploaded_path)] = destination.resolve()
         return destination.resolve()
 
     if not input_video:
@@ -269,9 +291,9 @@ def _source_key(source_mode, uploaded_video, input_video):
 
 
 def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, confidence, cache,
-                     progress=gr.Progress()):
+                     progress=gr.Progress(), request: gr.Request | None = None):
     cache = dict(cache or {})
-    empty = (None, None, [], [], 'Entire scene selected', gr.update(visible=False), cache)
+    empty = (None, None, [], [], SCENE_LABEL, gr.update(visible=False), gr.update(visible=False), cache)
     key = _source_key(source_mode, uploaded_video, input_video)
     if key is None:
         return empty
@@ -279,14 +301,27 @@ def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, conf
     cache_key = (*key, str(yolo_device), float(confidence))
     scan = cache.get(cache_key)
     if scan is None:
+        session = request.session_hash if request is not None else None
+        _stop_scan(request)  # A new scan replaces any older one still running in this session.
+        stop = threading.Event()
+        if session is not None:
+            _SCAN_STOPS[session] = stop
         try:
             progress(0, desc='Finding people in the video')
             source = _resolve_source(source_mode, uploaded_video, input_video)
-            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26s.pt'), yolo_device, float(confidence))
+            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26s.pt'), yolo_device, float(confidence),
+                                 should_stop=stop.is_set)
+        except ScanCancelled:
+            # Offer a way back to person selection, since re-picking the same video fires no event.
+            return (None, None, [], [], SCAN_STOPPED_LABEL, gr.update(visible=False),
+                    gr.update(visible=True), cache)
         except Exception as error:
             # Clear the scan so Analyze can never fall back to the previous video.
             gr.Warning(f'Subject preview failed: {error}')
             return empty
+        finally:
+            if session is not None and _SCAN_STOPS.get(session) is stop:
+                del _SCAN_STOPS[session]
         scan['origin'] = key
         cache[cache_key] = scan
         while len(cache) > SCAN_CACHE_SIZE:
@@ -298,8 +333,20 @@ def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, conf
     scan['more_ids'] = [track['id'] for track in more]
     def gallery_items(tracks):
         return [(track['preview'], f"Person {track['id']} · {track['seconds']:.1f}s") for track in tracks]
-    return (scan, None, gallery_items(recommended), gallery_items(more), 'Entire scene selected',
-            gr.update(visible=bool(more)), cache)
+    return (scan, None, gallery_items(recommended), gallery_items(more), SCENE_LABEL,
+            gr.update(visible=bool(more)), gr.update(visible=False), cache)
+
+
+def choose_entire_scene(source_mode, uploaded_video, input_video, scan, request: gr.Request | None = None):
+    """Select Entire scene; if the person scan is still running, stop it."""
+    stopped = _stop_scan(request)
+    current = _source_key(source_mode, uploaded_video, input_video)
+    if scan is not None and current is not None and scan.get('origin') == current:
+        # Scan already finished for this video: keep the people so the user can switch back.
+        return None, SCENE_LABEL, gr.update(), gr.update(), gr.update(), scan, gr.update(visible=False)
+    # No usable scan (stopped, or from another video): clear the people galleries.
+    return (None, SCAN_STOPPED_LABEL if stopped else SCENE_LABEL, [], [],
+            gr.update(visible=False), None, gr.update(visible=stopped))
 
 
 def select_subject(scan, group, evt: gr.SelectData):
@@ -330,6 +377,7 @@ def analyze_video(
     scan,
     selected_subject,
     progress=gr.Progress(),
+    request: gr.Request | None = None,
 ):
     """Run the existing pipeline and format its outputs for Gradio."""
     try:
@@ -355,10 +403,18 @@ def analyze_video(
         current = _source_key(source_mode, uploaded_video, input_video)
         if current is None:
             raise ValueError('Choose a video before starting the analysis.')
-        if scan is None or scan.get('origin') != current:
-            raise ValueError('The subject preview for this video is not ready. '
-                             'Wait for it to finish (or reselect the video), then try again.')
-        source = Path(scan['source'])
+        scene = selected_subject is None
+        if scene:
+            # Entire scene needs no person scan: stop one that may still be running.
+            _stop_scan(request)
+            scan_ok = scan is not None and scan.get('origin') == current
+            source = Path(scan['source']) if scan_ok else _resolve_source(source_mode, uploaded_video, input_video)
+            scan = None
+        else:
+            if scan is None or scan.get('origin') != current:
+                raise ValueError('The subject preview for this video is not ready. '
+                                 'Wait for it to finish (or reselect the video), then try again.')
+            source = Path(scan['source'])
         args = argparse.Namespace(
             input=str(source),
             output=None,
@@ -367,7 +423,7 @@ def analyze_video(
             aesthetic_device=aesthetic_device,
             confidence=confidence,
             target_id=selected_subject,
-            scene=selected_subject is None,
+            scene=scene,
             scan=scan,
             sample_seconds=sample_seconds,
             top_k=top_k,
@@ -450,7 +506,8 @@ def build_app() -> gr.Blocks:
                 gr.Markdown('### Choose a subject')
                 gr.Markdown('Choose a person or analyze the entire scene.')
                 entire_scene = gr.Button('Entire scene', variant='secondary')
-                subject_label = gr.Markdown('Entire scene selected')
+                subject_label = gr.Markdown(SCENE_LABEL)
+                rescan_button = gr.Button('Scan for people', variant='secondary', size='sm', visible=False)
                 subjects = gr.Gallery(label='Recommended people', columns=5, height='auto', object_fit='contain', allow_preview=False)
                 with gr.Accordion('Show more', open=False, visible=False) as more_section:
                     more_subjects = gr.Gallery(label='More people', columns=5, height='auto', object_fit='contain', allow_preview=False)
@@ -513,27 +570,47 @@ def build_app() -> gr.Blocks:
         upload_tab.select(lambda: "upload", outputs=source_mode, queue=False)
         folder_tab.select(lambda: "folder", outputs=source_mode, queue=False)
         refresh_button.click(refresh_input_choices, outputs=input_video, queue=False)
-        preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section]
+        preview_outputs = [scan_state, selected_subject, subjects, more_subjects, subject_label, more_section,
+                           rescan_button]
         preview_inputs = [yolo_device, confidence, scan_cache]
 
-        def preview_upload(video, device, conf, cache, progress=gr.Progress()):
-            return preview_subjects('upload', video, None, device, conf, cache, progress)
+        def preview_upload(video, device, conf, cache, request: gr.Request, progress=gr.Progress()):
+            return preview_subjects('upload', video, None, device, conf, cache, progress, request)
 
-        def preview_folder(video, device, conf, cache, progress=gr.Progress()):
-            return preview_subjects('folder', None, video, device, conf, cache, progress)
+        def preview_folder(video, device, conf, cache, request: gr.Request, progress=gr.Progress()):
+            return preview_subjects('folder', None, video, device, conf, cache, progress, request)
 
-        uploaded_video.change(preview_upload, inputs=[uploaded_video, *preview_inputs],
-                              outputs=preview_outputs + [scan_cache])
-        input_video.change(preview_folder, inputs=[input_video, *preview_inputs],
-                           outputs=preview_outputs + [scan_cache])
-        # Returning to the upload tab reuses the cached scan instead of copying and rescanning.
-        upload_tab.select(preview_upload, inputs=[uploaded_video, *preview_inputs],
-                          outputs=preview_outputs + [scan_cache])
-        folder_tab.select(lambda: (None, None, [], [], 'Entire scene selected', gr.update(visible=False), None),
+        scan_events = [
+            uploaded_video.change(preview_upload, inputs=[uploaded_video, *preview_inputs],
+                                  outputs=preview_outputs + [scan_cache]),
+            input_video.change(preview_folder, inputs=[input_video, *preview_inputs],
+                               outputs=preview_outputs + [scan_cache]),
+            # Returning to the upload tab reuses the cached scan instead of copying and rescanning.
+            upload_tab.select(preview_upload, inputs=[uploaded_video, *preview_inputs],
+                              outputs=preview_outputs + [scan_cache]),
+        ]
+
+        def preview_current(mode, uploaded, folder, device, conf, cache, request: gr.Request,
+                            progress=gr.Progress()):
+            return preview_subjects(mode, uploaded, folder, device, conf, cache, progress, request)
+
+        scan_events.append(rescan_button.click(
+            preview_current, inputs=[source_mode, uploaded_video, input_video, *preview_inputs],
+            outputs=preview_outputs + [scan_cache]))
+        folder_tab.select(lambda: (None, None, [], [], SCENE_LABEL, gr.update(visible=False),
+                                   gr.update(visible=False), None),
                           outputs=preview_outputs + [input_video], queue=False)
         subjects.select(select_recommended, inputs=[scan_state], outputs=[selected_subject, subject_label])
         more_subjects.select(select_more, inputs=[scan_state], outputs=[selected_subject, subject_label])
-        entire_scene.click(lambda: (None, 'Entire scene selected'), outputs=[selected_subject, subject_label], queue=False)
+        # Runs outside the queue so it responds even while a scan is running. It stops a
+        # running scan via the session flag; `cancels` also drops scans still waiting in the queue.
+        entire_scene.click(
+            choose_entire_scene,
+            inputs=[source_mode, uploaded_video, input_video, scan_state],
+            outputs=[selected_subject, subject_label, subjects, more_subjects, more_section, scan_state,
+                     rescan_button],
+            cancels=scan_events, queue=False,
+        )
         analyze_button.click(
             analyze_video,
             inputs=[
