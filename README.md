@@ -59,10 +59,10 @@ Each ranking run writes to `output/<video>_moments_<timestamp>/` by default.
 Open `index.html` for the ranked gallery, or find the selected images in
 `best/` and their scores in `best_frames.csv`.
 
-- `best/` and `best_target/` are full-quality PNGs of the selected frames.
-  The sampled frames in `candidates/` and `candidates_target/` are JPEG previews
-  to save disk space; all scores are computed from the decoded frames, not from
-  these previews.
+- `best/` and `best_target/` are full-quality PNGs of the selected frames; the
+  target box is drawn only on these final picks. The sampled frames in
+  `candidates/` are JPEG previews to save disk space; all scores are computed
+  from the decoded frames, not from these previews.
 
 - `baselines/aesthetic_only/top_1.png` is the tracked candidate with the highest
   raw aesthetic score. It reuses the scores computed for the main ranking.
@@ -76,8 +76,9 @@ Open `index.html` for the ranked gallery, or find the selected images in
 From the project folder with `.venv` active, run `python app.py` and open the
 URL printed in the terminal (normally `http://127.0.0.1:7860`).
 
-Upload a video or select one from `input/`. After the subject scan, choose a
-person or keep **Entire scene**, then click **Analyze video**. For a selected
+Upload a video or select one from `input/`. To rank the whole frame, keep
+**Entire scene** and click **Analyze video**; no person scan is needed. To follow
+a person, click **Find people**, pick a person, then click **Analyze video**. For a selected
 person, choose **Balanced**, **Clear subject**, **Subject fully shown**, or
 **Best-looking scene**. The gallery shows frames, timestamps, scores, and the
 output folder.

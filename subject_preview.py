@@ -6,27 +6,13 @@ import numpy as np
 from human_detector import HumanDetector, PROJECT_DIR
 
 
-class ScanCancelled(Exception):
-    """Raised when the caller asks a running scan to stop (e.g. user chose Entire scene)."""
-
-
-def scan_subjects(source, model, device, confidence, should_stop=None):
+def scan_subjects(source, model, device, confidence):
     capture = cv2.VideoCapture(str(source))
-    try:
-        return _scan(capture, source, model, device, confidence, should_stop)
-    finally:
-        capture.release()
-
-
-def _scan(capture, source, model, device, confidence, should_stop):
     fps = capture.get(cv2.CAP_PROP_FPS)
     detector = HumanDetector(model=model, confidence=confidence, device=device)
     tracks = {}
     index = 0
     while True:
-        # Checked every frame so a stop request takes effect within one detection step.
-        if should_stop is not None and should_stop():
-            raise ScanCancelled(f'Person scan stopped at frame {index}')
         ok, frame = capture.read()
         if not ok:
             break
@@ -61,6 +47,7 @@ def _scan(capture, source, model, device, confidence, should_stop):
                     track['preview'] = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                     track['preview_quality'] = quality
         index += 1
+    capture.release()
     for track_id, track in tracks.items():
         track['id'] = track_id
         track['size'] = float(np.percentile(track.pop('areas'), 75))

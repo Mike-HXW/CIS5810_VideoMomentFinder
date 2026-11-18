@@ -162,7 +162,6 @@ def run(args):
         (output / 'candidates').mkdir()
         (output / 'best').mkdir()
         if not scene:
-            (output / 'candidates_target').mkdir()
             (output / 'best_target').mkdir()
         print(f'Results folder: {output.resolve()}', flush=True)
         model_path = Path(args.model)
@@ -225,9 +224,8 @@ def run(args):
                                          'image': filename}
                             bbox = [0, 0, frame_width, frame_height]
                         else:
-                            target_filename = f'candidates_target/frame_{frame_index:07d}.jpg'
-                            write_image(output / target_filename, draw_target(frame, target), jpeg=True)
-                            candidate = {**target, 'image': filename, 'target_image': target_filename}
+                            # The target box is drawn only on the final picks (best_target/).
+                            candidate = {**target, 'image': filename}
                             bbox = [target[key] for key in ('x1', 'y1', 'x2', 'y2')]
                         # Score the decoded frame itself, not the stored JPEG, so scores are unchanged.
                         candidate['sharpness_raw'] = tenengrad_sharpness(frame, bbox)
