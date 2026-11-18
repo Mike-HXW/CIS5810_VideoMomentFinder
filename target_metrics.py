@@ -96,12 +96,19 @@ def tenengrad_sharpness(frame: np.ndarray, bbox: Sequence[float]) -> float:
     return score if math.isfinite(score) else 0.0
 
 
-def visibility_components(bbox: Sequence[float], frame_width: int, frame_height: int, track_stability: float,) -> dict[str, float]:
+def visibility_components(
+    bbox: Sequence[float], frame_width: int, frame_height: int, track_stability: float,
+    include_bottom_edge: bool = True,
+) -> dict[str, float]:
     """Return interpretable framing proxies for target visibility.
 
     This intentionally does not claim to detect semantic occlusion. It scores
     whether the tracked target is large enough, clear of frame boundaries, and
     present consistently in nearby frames.
+
+    With ``include_bottom_edge=False`` a box touching the bottom edge is not
+    penalized: half-body framing (legs cut off by the bottom of the frame) is a
+    normal composition, while a cut at the top or sides still clips the subject.
     """
     box = _validated_box(bbox, frame_width, frame_height)
     if box is None:
@@ -118,7 +125,7 @@ def visibility_components(bbox: Sequence[float], frame_width: int, frame_height:
     # Targets below 2% of the frame are difficult to judge; 15% reaches full credit.
     size_score = _clamp01((area_ratio - 0.02) / (0.15 - 0.02))
 
-    margins = (x1, y1, frame_width - x2, frame_height - y2)
+    margins = (x1, y1, frame_width - x2) + ((frame_height - y2,) if include_bottom_edge else ())
     relative_clearance = min(margins) / float(min(frame_width, frame_height))
     # Three percent of the shorter frame side is enough to count as clear of an edge.
     edge_clearance_score = _clamp01(relative_clearance / 0.03)
@@ -220,7 +227,11 @@ def score_candidates(
             target_presence, candidate["frame_index"], stability_window_frames,
         )
         # visibility = target size + distance from frame edges + tracking continuity
-        candidate.update(visibility_components(bbox, frame_width, frame_height, stability))
+        # Only "Subject fully shown" still requires clearance from the bottom edge.
+        candidate.update(visibility_components(
+            bbox, frame_width, frame_height, stability,
+            include_bottom_edge=preset == "subject-fully-shown",
+        ))
         # composition proximity to rule-of-thirds points
         candidate["composition_score"] = composition_score(bbox, frame_width, frame_height)
 

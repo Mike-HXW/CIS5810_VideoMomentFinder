@@ -282,7 +282,7 @@ def preview_subjects(source_mode, uploaded_video, input_video, yolo_device, conf
         try:
             progress(0, desc='Finding people in the video')
             source = _resolve_source(source_mode, uploaded_video, input_video)
-            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26n.pt'), yolo_device, float(confidence))
+            scan = scan_subjects(source, str(PROJECT_DIR / 'yolo26s.pt'), yolo_device, float(confidence))
         except Exception as error:
             # Clear the scan so Analyze can never fall back to the previous video.
             gr.Warning(f'Subject preview failed: {error}')
@@ -362,7 +362,7 @@ def analyze_video(
         args = argparse.Namespace(
             input=str(source),
             output=None,
-            model="yolo26n.pt",
+            model="yolo26s.pt",
             device=yolo_device,
             aesthetic_device=aesthetic_device,
             confidence=confidence,

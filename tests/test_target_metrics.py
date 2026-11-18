@@ -34,6 +34,15 @@ class TargetMetricsTests(unittest.TestCase):
         self.assertGreater(good["visibility_score"], poor["visibility_score"])
         self.assertEqual(poor["edge_clearance_score"], 0.0)
 
+    def test_bottom_edge_can_be_ignored_for_half_body_framing(self):
+        half_body = (300, 120, 700, 1000)  # touches only the bottom edge
+        strict = visibility_components(half_body, 1000, 1000, 1.0)
+        relaxed = visibility_components(half_body, 1000, 1000, 1.0, include_bottom_edge=False)
+        self.assertEqual(strict["edge_clearance_score"], 0.0)
+        self.assertEqual(relaxed["edge_clearance_score"], 1.0)
+        top_cut = visibility_components((300, 0, 700, 800), 1000, 1000, 1.0, include_bottom_edge=False)
+        self.assertEqual(top_cut["edge_clearance_score"], 0.0)
+
     def test_composition_prefers_rule_of_thirds_to_corner(self):
         near_third = composition_score((233, 233, 433, 433), 1000, 1000)
         corner = composition_score((0, 0, 100, 100), 1000, 1000)
