@@ -84,12 +84,89 @@ For a selected person, choose **Balanced**, **Clear subject**, **Subject fully
 shown**, or **Best-looking scene**. The gallery shows frames, timestamps, scores,
 and the output folder.
 
-The tracker keeps a lost person's ID for `track_buffer` frames (`botsort_reid.yaml`)
-and compensates for camera motion, which helps with short detection gaps and small
-pans. A person who walks out of the frame and comes back usually gets a new ID (see
-[Future work](#future-work-identity-across-hard-cuts-and-re-entries)). If one person
-shows up as several entries, click all of them to treat them as one person (click
-again to remove).
+A person who leaves the frame and comes back to about the same spot within
+`track_buffer` frames (90, about 3 s at 30 fps) keeps the same ID; see
+[Re-entry compensation](#re-entry-compensation-keeping-one-id-when-the-camera-turns-away).
+If one person still shows up as several entries, click all of them to treat them as
+one person (click again to remove).
+
+## Re-entry compensation: keeping one ID when the camera turns away
+
+A common way to film on a phone is to turn away from a person for a few seconds and
+then turn back. Out of the box, the tracker gives that person a new ID every time,
+so one person is split into several entries. `_freeze_lost_tracks()` in
+`human_detector.py` fixes this. It patches the tracker when the module is imported,
+so the person scan and `moment_finder.py` both use it. It adds no computation.
+
+### How the tracker links people across frames
+
+The tracker is BoT-SORT (`botsort_reid.yaml`), which is ByteTrack plus camera-motion
+compensation (GMC) and appearance matching (ReID):
+
+- **ByteTrack** predicts where each person will be in the next frame with a Kalman
+  filter (box position, size and their velocities), then gives each new YOLO box the
+  ID of the prediction it overlaps most. When nobody matches a track, the track goes
+  on a "lost" list and can still be matched for `track_buffer` frames.
+- **GMC** estimates how the camera moved between frames and moves every predicted
+  box by the same amount.
+- **ReID** compares appearance, but only when boxes already overlap (IoU >= 0.5), so
+  it cannot find a person whose predicted box is in the wrong place.
+
+So a returning person keeps the old ID only if the lost track's box still overlaps
+where they reappear (IoU above about 0.2).
+
+### What went wrong while the person was gone
+
+Measured on `input/person_in_out.mp4` (412 frames, 30 fps, 720x1280): the person is
+on screen three times and is gone for 71 and 81 frames in between. Ultralytics
+8.4.158 had three problems:
+
+| Problem | What happened in the clip |
+|---|---|
+| A lost track keeps moving at the speed it had when it disappeared. Leaving the frame is fast, so the box flies off. | After 71 lost frames the predicted box was at x ~ 2000 (the frame is 720 wide). |
+| The first frame after the last detection is predicted one step further. A person leaving through the bottom edge looks like a box that is quickly getting shorter. | The box shrank from 121 px tall to 23 px, then stayed that way. |
+| GMC keeps moving the lost box. The camera turns away and back, so the real net motion is about zero, but the per-frame errors add up over 80 frames. | The box drifted ~100 px and no longer overlapped the returning person (IoU 0). |
+
+Each of these alone is enough to give the person a new ID.
+
+### What the patch changes
+
+Only lost tracks are affected. While a person is on screen, tracking works exactly
+as before.
+
+1. When a track is lost, its box goes back to the last box that matched a detection
+   (this undoes the extra step).
+2. While it is lost, its position and size do not change (all velocities are zero).
+3. GMC is not applied to lost tracks.
+
+In short: while a person is gone, the tracker assumes they are still where they
+were last seen.
+
+### Result on `person_in_out.mp4`
+
+| Version | IDs for the person | Appearances joined |
+|---|---|---|
+| Ultralytics default | 3 | none |
+| Patch steps 1-2 only, GMC on lost tracks | 2 | first return |
+| Full patch, `track_buffer: 90` | 1 | both returns |
+
+The clip also has two short extra IDs from duplicate YOLO boxes (one frame at frame
+107, and a frame-wide box from frame 338). They are detection errors, not re-entries.
+
+`track_buffer` must be longer than the time the person is gone: at 60 frames the
+lost track is deleted before either return. Values much larger than needed make it
+more likely that two people who cross get each other's IDs.
+
+### Limits
+
+- The person must come back to about the same place in the frame. If the camera does
+  not return to where it was, or the person has moved, they get a new ID (as before
+  the patch). Use multi-select to combine the entries.
+- It does not help at hard cuts in edited videos; see
+  [Future work](#future-work-identity-across-hard-cuts-and-re-entries).
+- It relies on Ultralytics internals (`STrack.multi_predict`,
+  `BOTrack.multi_predict`, `byte_tracker.multi_gmc`). Recheck it when
+  `ultralytics==8.4.158` in `requirements.txt` is upgraded.
 
 ## Tests and checks
 
@@ -104,8 +181,10 @@ of one image (default `input/person.jpg`); it loads the full model.
 ## Future work: identity across hard cuts and re-entries
 
 The app targets unedited clips that users record themselves, so this is not a current
-goal. It matters for **edited videos** (hard cuts between shots) and, partly, for
-**people who walk out of the frame and come back**. Everything below was prototyped and
+goal. It matters for **edited videos** (hard cuts between shots) and for **people who
+come back somewhere else in the frame** (returning to the same spot is already handled
+by [re-entry compensation](#re-entry-compensation-keeping-one-id-when-the-camera-turns-away)).
+Everything below was prototyped and
 measured in November 2026, then left out because it slowed the person scan by 4-5x
 for little gain on the target videos. Plan B (select several entries as one person)
 is the only part that shipped.
@@ -116,10 +195,9 @@ is the only part that shipped.
   tracker kept ID 1 across every cut, so "Person 1" mixed Clarkson and Hammond.
   Close-up shots fill the frame, so the boxes before and after a cut overlap heavily
   (IoU 0.32-0.87) and BoT-SORT links them by position.
-- **Re-entry.** A person who walks out and back in gets a new ID even with
-  `track_buffer: 120`: the lost track's Kalman prediction keeps moving in the exit
-  direction, so the new box no longer overlaps it, and ReID is only consulted when
-  boxes overlap.
+- **Re-entry somewhere else.** Re-entry compensation keeps a lost track where it was
+  last seen. A person who comes back in a different place does not overlap it and
+  gets a new ID, because ReID is only consulted when boxes overlap.
 
 ### Why tracker settings alone cannot fix it
 
@@ -203,7 +281,8 @@ Measured on GPU:
   per piece, and load the model in the background when the app starts.
 - **A real person re-identification model** (e.g. OSNet) or face embeddings should
   separate people much better than SigLIP, at the cost of a new dependency.
-- **Re-entry in unedited clips** is the same grouping problem without cuts: group
+- **Re-entry in a different place** is the same grouping problem without cuts: group
   tracks that are never on screen together by appearance.
 - **Test clips to collect**: edited videos with cuts between people standing in the
-  same spot, several people in similar clothes, and a person walking out and back in.
+  same spot, several people in similar clothes, and a person who leaves and comes back
+  somewhere else in the frame.

@@ -20,6 +20,59 @@ IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 VIDEO_EXTENSIONS = {".avi", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
 
 
+def _freeze_lost_tracks() -> None:
+    """Keep a lost track at the box where it was last seen until the person returns.
+
+    Phone videos often turn away from a person for a few seconds and then back.
+    Ultralytics (8.4.158) handles that badly, so the returning person gets a new ID:
+
+    - it keeps moving a lost track with its last velocity, which is large while the
+      person slides out of frame, so after ~70 frames the box is far off-screen;
+    - it predicts one more step past the last detection, so a person leaving through
+      the frame edge leaves behind a collapsed box (121 px tall became 23 px);
+    - camera-motion compensation (GMC) keeps shifting the lost box, and its errors add
+      up over a long pan (the box drifted ~100 px even though the camera came back).
+
+    So a lost track goes back to its last matched box, stops moving, and is left out
+    of GMC. Tracked tracks are unchanged. This costs no extra computation.
+    """
+    from ultralytics.trackers import byte_tracker
+    from ultralytics.trackers.basetrack import TrackState
+    from ultralytics.trackers.bot_sort import BOTrack
+
+    if getattr(byte_tracker.multi_gmc, "_vmf_frozen", False):
+        return
+
+    for track_class in (byte_tracker.STrack, BOTrack):
+        original = track_class.multi_predict
+
+        def multi_predict(stracks, _original=original):
+            for track in stracks:
+                if track.mean is None:
+                    continue
+                if track.state == TrackState.Tracked:
+                    track._vmf_seen = track.mean[:4].copy()  # box after the last matched detection
+                    continue
+                track.mean = track.mean.copy()
+                seen = track.__dict__.pop("_vmf_seen", None)
+                if seen is not None:  # first frame lost: undo the step predicted past the last detection
+                    track.mean[:4] = seen
+                track.mean[4:] = 0  # no motion while lost (state is x, y, w|a, h, then velocities)
+            _original(stracks)
+
+        track_class.multi_predict = staticmethod(multi_predict)
+
+    original_gmc = byte_tracker.multi_gmc
+
+    def multi_gmc(stracks, H):
+        original_gmc([track for track in stracks if track.state != TrackState.Lost], H)
+
+    multi_gmc._vmf_frozen = True
+    byte_tracker.multi_gmc = multi_gmc
+
+_freeze_lost_tracks()
+
+
 @dataclass(frozen=True)
 class Detection:
     """A detected person in pixel coordinates."""
